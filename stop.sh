@@ -3,7 +3,7 @@
 # AI MDPL Bill of Lading Extractor — Stop Script (DGX Spark)
 # ===========================================================================
 # Stops ONLY the FastAPI gateway. It deliberately NEVER touches the shared
-# llama-server (Toby's pre-existing model). The name-based fallback is scoped
+# vLLM server (Toby's pre-existing model). The name-based fallback is scoped
 # strictly to bol_service.py so we can't kill the model.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,4 +32,4 @@ else
 fi
 
 rm -f "$PID_FILE"
-echo -e "${GREEN}BOL Extractor stopped. (The shared model server was left untouched.)${NC}"
+echo -e "${GREEN}BOL Extractor stopped. (The shared vLLM server was left untouched.)${NC}"

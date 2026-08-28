@@ -1,8 +1,8 @@
 """
-Unit + integration tests for the AI MDPL Bill of Lading Extractor (v2.1).
+Unit + integration tests for the AI MDPL Bill of Lading Extractor (v3, vLLM Migration).
 
 These run on the Windows dev machine with a STUB model backend (no GPU, no
-llama.cpp needed). The app's http_model_call is monkeypatched so the full
+vLLM needed). The app's http_model_call is monkeypatched so the full
 FastAPI stack can be exercised.
 
 Run:  pytest -v
@@ -12,7 +12,6 @@ import os
 import json
 import pytest
 from fastapi.testclient import TestClient
-import requests
 
 import bol_service as bol
 
@@ -23,19 +22,14 @@ CASES = os.path.join(os.path.dirname(__file__), "cases")
 
 
 class FakeResp:
-    """Minimal stand-in for requests.Response."""
+    """Minimal stand-in for requests.Response (healthz probe mock)."""
 
-    def __init__(self, status_code, text="", payload=None):
+    def __init__(self, status_code=200, text="", json_data=None):
         self.status_code = status_code
-        self._text = text
-        self._payload = payload or {}
-
-    @property
-    def text(self):
-        return self._text
+        self._json_data = json_data or {}
 
     def json(self):
-        return self._payload
+        return self._json_data
 
 
 def _messages():
@@ -119,6 +113,34 @@ class TestGoldenSample:
         sys_msg = seen["messages"][0]["content"]
         assert '"AssistantVersion"' in sys_msg
         assert "J2.1" in sys_msg
+
+
+# --------------------------------------------------------------------------
+# vLLM config constant tests
+# --------------------------------------------------------------------------
+class TestVLLMConfig:
+    def test_context_size_is_32768(self):
+        """vLLM MAX_MODEL_LEN = 32768, no slot division."""
+        assert bol.CONTEXT_SIZE == 32768
+
+    def test_model_name_is_vllm(self):
+        assert bol.MODEL_NAME == "Qwen3.6-35B-A3B-NVFP4"
+
+    def test_model_url_is_vllm(self):
+        assert "8011" in bol.MODEL_URL
+
+    def test_model_parallel_not_defined(self):
+        """vLLM has no slot division -- MODEL_PARALLEL must not exist."""
+        assert not hasattr(bol, "MODEL_PARALLEL")
+
+    def test_api_key_is_vllm(self):
+        assert bol.LLAMA_SERVER_API_KEY == "test_key_0000"
+
+    def test_request_timeout_is_120(self):
+        assert bol.REQUEST_TIMEOUT == 120
+
+    def test_params_levels_are_two(self):
+        assert bol._PARAMS_LEVELS == (0, 1)
 
 
 # --------------------------------------------------------------------------
@@ -318,24 +340,22 @@ class TestLoadCustomerTable:
 
 
 # --------------------------------------------------------------------------
-# Context guard machinery
+# Context guard machinery (vLLM — continuous batching, no slots)
 # --------------------------------------------------------------------------
 class TestContextGuard:
-    def test_slot_budget_math(self, monkeypatch):
-        monkeypatch.setattr(bol, "CONTEXT_SIZE", 65536)
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 4)
-        assert bol.slot_budget() == 16384
+    def test_usable_prompt_room_vllm_budget(self):
+        """vLLM: no slot division — full CONTEXT_SIZE."""
+        room = bol.usable_prompt_room()
+        expected = 32768 - 4096 - bol._SAFETY_MARGIN
+        assert room == expected
 
-    def test_slot_budget_minimum_one(self, monkeypatch):
-        monkeypatch.setattr(bol, "CONTEXT_SIZE", 1)
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 100)
-        assert bol.slot_budget() >= 1
+    def test_context_budget_32k_default(self):
+        """vLLM MAX_MODEL_LEN = 32768, no slot division."""
+        assert bol.CONTEXT_SIZE == 32768
 
-    def test_usable_prompt_room(self, monkeypatch):
-        monkeypatch.setattr(bol, "CONTEXT_SIZE", 65536)
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 4)
-        monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 4096)
-        assert bol.usable_prompt_room() == 16384 - 4096 - bol._SAFETY_MARGIN
+    def test_slot_budget_doesnt_exist(self):
+        """vLLM has no slot division — slot_budget() must be removed."""
+        assert not hasattr(bol, "slot_budget")
 
     def test_estimate_tokens_chars_div_three_ceiling(self):
         assert bol.estimate_tokens("") == 0
@@ -343,19 +363,19 @@ class TestContextGuard:
         assert bol.estimate_tokens("a" * 301) == 101
 
     def test_strict_guard_rejects_oversized_prompt(self, monkeypatch):
-        monkeypatch.setattr(bol, "CONTEXT_SIZE", 4096)
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 4)   # slot=1024
-        monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 64)
+        monkeypatch.setattr(bol, "CONTEXT_SIZE", 8192)
+        monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 4096)
         monkeypatch.setattr(bol, "CONTEXT_GUARD", "strict")
-        big = [{"role": "user", "content": "x" * 6000}]
+        # room = 8192 - 4096 - 256 = 3840 tokens → need > 3840*3 = 11520 chars
+        big = [{"role": "user", "content": "x" * 12000}]
         with pytest.raises(bol.ContextGuardExceeded) as exc:
             bol.check_context(big)
         msg = str(exc.value)
-        assert "re-provision" in msg or "slot budget" in msg
+        assert "vLLM" in msg
+        assert "context" in msg.lower()
 
     def test_warn_guard_allows_with_warning(self, monkeypatch):
         monkeypatch.setattr(bol, "CONTEXT_SIZE", 4096)
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 4)
         monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 64)
         monkeypatch.setattr(bol, "CONTEXT_GUARD", "warn")
         big = [{"role": "user", "content": "x" * 6000}]
@@ -363,7 +383,7 @@ class TestContextGuard:
 
     def test_off_guard_skips_entirely(self, monkeypatch):
         monkeypatch.setattr(bol, "CONTEXT_SIZE", 1)
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 100)
+        monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 100)
         monkeypatch.setattr(bol, "CONTEXT_GUARD", "off")
         bol.check_context([{"role": "user", "content": "x" * 999999}])
 
@@ -372,25 +392,38 @@ class TestContextGuard:
             monkeypatch.setattr(bol, "CONTEXT_GUARD", mode)
             bol.check_context([{"role": "user", "content": "tiny"}])
 
+    def test_check_context_error_mentions_vllm_and_no_slots(self, monkeypatch):
+        monkeypatch.setattr(bol, "CONTEXT_SIZE", 8192)
+        monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 4096)
+        monkeypatch.setattr(bol, "CONTEXT_GUARD", "strict")
+        big = [{"role": "user", "content": "x" * 12000}]
+        with pytest.raises(bol.ContextGuardExceeded) as exc:
+            bol.check_context(big)
+        msg = str(exc.value)
+        assert "vLLM" in msg
+        assert "slot" not in msg.lower() and "parallel" not in msg.lower()
+
 
 # --------------------------------------------------------------------------
-# Sampling params + thinking-suppression degradation chain
+# Sampling params + vLLM-native thinking-suppression (2-level)
 # --------------------------------------------------------------------------
 class TestBuildParams:
-    def test_level0_includes_both_suppression_fields(self):
+    def test_level0_has_chat_template_kwargs(self):
         p = bol.build_params(0)
-        assert p["reasoning_effort"] == 0
         assert p["chat_template_kwargs"] == {"enable_thinking": False}
         assert p["temperature"] == bol.MODEL_TEMP
 
-    def test_level1_drops_chat_template_kwargs_only(self):
+    def test_level1_drops_chat_template_kwargs(self):
         p = bol._params_at_level(bol.build_params(0), 1)
         assert "chat_template_kwargs" not in p
-        assert p["reasoning_effort"] == 0
 
-    def test_level2_drops_reasoning_effort_too(self):
-        p = bol._params_at_level(bol.build_params(0), 2)
-        assert "chat_template_kwargs" not in p
+    def test_degradation_levels_is_two(self):
+        """vLLM: 2-level chain (0, 1)."""
+        assert bol._PARAMS_LEVELS == (0, 1)
+
+    def test_level0_no_reasoning_effort(self):
+        """vLLM migration: reasoning_effort must NEVER appear."""
+        p = bol.build_params(0)
         assert "reasoning_effort" not in p
 
     def test_disable_thinking_false_skips_suppression(self, monkeypatch):
@@ -406,71 +439,131 @@ class TestBuildParams:
 
 
 # --------------------------------------------------------------------------
-# Model backend HTTP behavior (FakeResp-based)
+# Model backend HTTP behavior (vLLM httpx.AsyncClient)
 # --------------------------------------------------------------------------
 class TestHttpModelCall:
     def _ok_payload(self, content="{}"):
         return {"choices": [{"message": {"content": content}}]}
 
+    def _run_coro(self, coro):
+        """Helper to run an async coroutine synchronously (used by all mocks)."""
+        import asyncio
+        return asyncio.run(coro)
+
     def test_success_returns_content(self, monkeypatch):
-        monkeypatch.setattr(bol.requests, "post",
-                            lambda *a, **k: FakeResp(200, payload=self._ok_payload('{"x":1}')))
+        async def fake_post(body, headers):
+            return self._ok_payload('{"x":1}')
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
+
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
         out = bol.http_model_call(_messages(), bol.build_params(0))
         assert out == '{"x":1}'
 
-    def test_degradation_chain_drops_rejected_params(self, monkeypatch):
-        bodies = []
+    def test_http_call_vllm_2_level_degradation(self, monkeypatch):
+        """vLLM: 2-level chain (not 3)."""
+        call_count = {"n": 0}
 
-        def fake_post(url, json=None, headers=None, timeout=None):
-            bodies.append(dict(json))
-            if "chat_template_kwargs" in json:
-                return FakeResp(400, text="unknown field: chat_template_kwargs")
-            return FakeResp(200, payload=self._ok_payload("done"))
+        async def fake_post(body, headers):
+            call_count["n"] += 1
+            if "chat_template_kwargs" in body:
+                return {"error": {"message": "unknown field: chat_template_kwargs"}}
+            return self._ok_payload("done")
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
 
         monkeypatch.setattr(bol, "_PARAMS_LEVEL", 0)
-        monkeypatch.setattr(bol.requests, "post", fake_post)
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
         out = bol.http_model_call(_messages(), bol.build_params(0))
         assert out == "done"
-        assert len(bodies) == 2
-        assert "chat_template_kwargs" not in bodies[-1]
-        assert "reasoning_effort" in bodies[-1]
+        assert call_count["n"] == 2
 
-    def test_degradation_caches_working_level(self, monkeypatch):
-        calls = {"n": 0}
+    def test_http_call_vllm_no_reasoning_effort_sent(self, monkeypatch):
+        """vLLM: reasoning_effort must never appear in the body."""
+        bodies = []
 
-        def fake_post(url, json=None, headers=None, timeout=None):
-            calls["n"] += 1
-            if "chat_template_kwargs" in json:
-                return FakeResp(400, text="server rejected chat_template_kwargs")
-            return FakeResp(200, payload=self._ok_payload("ok"))
+        async def fake_post(body, headers):
+            bodies.append(dict(body))
+            return self._ok_payload("ok")
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
+
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
+        bol.http_model_call(_messages(), bol.build_params(0))
+        for body in bodies:
+            assert "reasoning_effort" not in body
+
+    def test_http_call_vllm_caches_working_level(self, monkeypatch):
+        """After level 1 succeeds, subsequent calls go straight to level 1."""
+        call_count = {"n": 0}
+
+        async def fake_post(body, headers):
+            call_count["n"] += 1
+            if "chat_template_kwargs" in body:
+                return {"error": {"message": "server rejected chat_template_kwargs"}}
+            return self._ok_payload("ok")
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
 
         monkeypatch.setattr(bol, "_PARAMS_LEVEL", 0)
-        monkeypatch.setattr(bol.requests, "post", fake_post)
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
+
         bol.http_model_call(_messages(), bol.build_params(0))
-        first_calls = calls["n"]
-        # Second call should skip straight to the cached level.
+        first_calls = call_count["n"]
+
         bol.http_model_call(_messages(), bol.build_params(0))
-        assert calls["n"] == first_calls + 1
+        assert call_count["n"] == first_calls + 1
 
     def test_context_overflow_maps_to_context_exceeded(self, monkeypatch):
-        monkeypatch.setattr(bol.requests, "post",
-                            lambda *a, **k: FakeResp(400, text="request exceeds context length"))
+        async def fake_post(body, headers):
+            return {"error": {"message": "request exceeds context length"}}
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
+
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
         with pytest.raises(bol.ContextExceeded):
             bol.http_model_call(_messages(), bol.build_params(0))
 
     def test_generic_error_maps_to_model_unavailable(self, monkeypatch):
-        monkeypatch.setattr(bol.requests, "post",
-                            lambda *a, **k: FakeResp(500, text="internal error"))
+        async def fake_post(body, headers):
+            return {"error": {"message": "internal error"}}
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
+
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
         with pytest.raises(bol.ModelUnavailable):
             bol.http_model_call(_messages(), bol.build_params(0))
 
-    def test_connection_error_maps_to_model_unavailable(self, monkeypatch):
-        def boom(*a, **k):
-            raise requests.exceptions.ConnectionError("refused")
+    def test_vllm_usage_parsed_from_response(self, monkeypatch):
+        """vLLM response includes 'usage' dict with prompt/completion tokens."""
+        captured = {}
 
-        monkeypatch.setattr(bol.requests, "post", boom)
-        with pytest.raises(bol.ModelUnavailable):
-            bol.http_model_call(_messages(), bol.build_params(0))
+        async def fake_post(body, headers):
+            captured["body"] = dict(body)
+            return {
+                "choices": [{"message": {"content": "{}"}}],
+                "usage": {"prompt_tokens": 150, "completion_tokens": 25},
+            }
+
+        def fake_run_async(coro):
+            return self._run_coro(coro)
+
+        monkeypatch.setattr(bol, "_post_async", fake_post)
+        monkeypatch.setattr(bol, "_run_async", fake_run_async)
+        bol.http_model_call(_messages(), bol.build_params(0))
+        assert captured.get("body", {}).get("model") == "Qwen3.6-35B-A3B-NVFP4"
 
 
 class TestResolveContent:
@@ -598,8 +691,10 @@ class TestApiSurface:
             assert ep in payload["endpoints"]
 
     def test_healthz_degraded_when_model_down(self, client, monkeypatch):
+        import requests as req
+
         def unreachable(url, **kw):
-            raise requests.exceptions.ConnectionError("refused")
+            raise req.exceptions.ConnectionError("refused")
 
         monkeypatch.setattr(bol.requests, "get", unreachable)
         r = client.get("/healthz")
@@ -609,33 +704,60 @@ class TestApiSurface:
         assert payload["model_server"].startswith("unreachable")
         assert payload["version"] == "J2.1"
 
-    def test_healthz_ok_with_context_crosscheck(self, client, monkeypatch):
+    def test_healthz_reports_vllm_fields(self, client, monkeypatch):
+        import requests as req
+
         def fake_get(url, **kw):
             if url.endswith("/health"):
-                return FakeResp(200, payload={"n_ctx": 65536})
-            if url.endswith("/props"):
-                return FakeResp(200, payload={
-                    "default_generation_settings": {"n_ctx": bol.slot_budget()}})
+                return FakeResp(200, json_data={"status": "ok"})
+            if url.endswith("/v1/models"):
+                return FakeResp(200, json_data={
+                    "data": [{"id": "Qwen3.6-35B-A3B-NVFP4"}]
+                })
+            return FakeResp(404)
+
+        monkeypatch.setattr(bol.requests, "get", fake_get)
+        r = client.get("/healthz")
+        body = r.json()
+        assert body["status"] == "healthy"
+        assert body["model_server"] == "ready"
+        assert "vllm_model_id" in body
+        assert body["vllm_model_id"] == "Qwen3.6-35B-A3B-NVFP4"
+        assert "thinking_disabled" in body
+        assert "context_guard" in body
+        # vLLM: no slot_tokens
+        assert "slot_tokens" not in body["context_budget"]
+
+    def test_healthz_has_no_slot_tokens_field(self, client, monkeypatch):
+        import requests as req
+
+        def fake_get(url, **kw):
+            if url.endswith("/health"):
+                return FakeResp(200, json_data={"status": "ok"})
+            if url.endswith("/v1/models"):
+                return FakeResp(200, json_data={"data": [{"id": "Qwen3.6-35B-A3B-NVFP4"}]})
             return FakeResp(404)
 
         monkeypatch.setattr(bol.requests, "get", fake_get)
         r = client.get("/healthz")
         payload = r.json()
-        assert payload["status"] == "healthy"
-        assert payload["context_budget"]["check"] == "match"
+        assert "slot_tokens" not in payload.get("context_budget", {})
+        assert "context_size" in payload.get("context_budget", {})
 
-    def test_healthz_context_mismatch_reported(self, client, monkeypatch):
+    def test_healthz_context_budget_reports_context_size(self, client, monkeypatch):
+        import requests as req
+
         def fake_get(url, **kw):
             if url.endswith("/health"):
-                return FakeResp(200, payload={"n_ctx": 65536})
-            if url.endswith("/props"):
-                return FakeResp(200, payload={
-                    "default_generation_settings": {"n_ctx": bol.slot_budget() + 999}})
+                return FakeResp(200, json_data={"status": "ok"})
+            if url.endswith("/v1/models"):
+                return FakeResp(200, json_data={"data": [{"id": "Qwen3.6-35B-A3B-NVFP4"}]})
             return FakeResp(404)
 
         monkeypatch.setattr(bol.requests, "get", fake_get)
         r = client.get("/healthz")
-        assert r.json()["context_budget"]["check"] == "mismatch"
+        payload = r.json()
+        assert payload["context_budget"]["context_size"] == bol.CONTEXT_SIZE
 
     def test_extract_503_when_unparseable_output(self, client, monkeypatch):
         monkeypatch.setattr(bol, "http_model_call",
@@ -644,8 +766,7 @@ class TestApiSurface:
         assert r.status_code == 503
 
     def test_extract_422_on_context_guard_exceeded(self, client, monkeypatch):
-        monkeypatch.setattr(bol, "CONTEXT_SIZE", 4096)      # slot=1024
-        monkeypatch.setattr(bol, "MODEL_PARALLEL", 4)
+        monkeypatch.setattr(bol, "CONTEXT_SIZE", 4096)
         monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 64)
         monkeypatch.setattr(bol, "CONTEXT_GUARD", "strict")
         huge = "x" * 20000
@@ -671,7 +792,6 @@ def test_defaults_sync_to_env_example():
             settings[key.strip()] = val.strip().strip('"').strip("'")
 
     assert int(settings["CONTEXT_SIZE"]) == bol.CONTEXT_SIZE
-    assert int(settings["MODEL_PARALLEL"]) == bol.MODEL_PARALLEL
     assert int(settings["API_PORT"]) == bol.API_PORT
     assert int(settings["MODEL_MAX_TOKENS"]) == bol.MODEL_MAX_TOKENS
     assert int(settings["REQUEST_TIMEOUT"]) == bol.REQUEST_TIMEOUT
@@ -680,7 +800,14 @@ def test_defaults_sync_to_env_example():
     assert int(settings["MODEL_TOP_K"]) == bol.MODEL_TOP_K
     assert settings["LLAMA_SERVER_API_KEY"] == bol.LLAMA_SERVER_API_KEY
     assert settings["MODEL_NAME"] == bol.MODEL_NAME
+    assert settings["MODEL_URL"] == bol.MODEL_URL
     assert settings["CONTEXT_GUARD"] == bol.CONTEXT_GUARD
     assert settings["API_KEY_AUTH_HEADER"] == bol.API_KEY_AUTH_HEADER
+    # vLLM config invariants
+    assert bol.CONTEXT_SIZE == 32768
+    assert bol.MODEL_NAME == "Qwen3.6-35B-A3B-NVFP4"
+    assert "8011" in bol.MODEL_URL
+    assert bol.LLAMA_SERVER_API_KEY == "test_key_0000"
+    assert bol.REQUEST_TIMEOUT == 120
     # Port allocation sanity per the roadmap port map.
     assert bol.API_PORT == 8086

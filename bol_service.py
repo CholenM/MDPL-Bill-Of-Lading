@@ -1,16 +1,16 @@
 """
-AI MDPL Bill of Lading Extractor — FastAPI Service (v2.1 / "J2.1")
+AI MDPL Bill of Lading Extractor — FastAPI Service (v3, vLLM Migration)
 ======================================================================
 Lean, JSON-in / JSON-out **Bill of Lading Extractor** for the Japan market.
 Parses pre-extracted B/L document text into the standardized shipment JSON
 defined in the project spec (AssistantVersion J2.1), and runs fully offline on
-the NVIDIA DGX Spark by reusing the already-running llama.cpp (CUDA) model
-server. This service is a **gateway only** — it never starts or stops the model
-server (see start.sh / stop.sh).
+the NVIDIA DGX Spark by connecting to the shared vLLM model server
+(Qwen3.6-35B-A3B-NVFP4 on :8011). This service is a **gateway only** — it
+never starts or stops the model server (see start.sh / stop.sh).
 
 Document parsing (PDF/image/OCR) is deliberately OUT OF SCOPE: callers send
 pre-extracted plain text, matching the Proof-Reader / QA-Manager /
-GDS-Extraction siblings (Qwen3.8 is served without vision).
+GDS-Extraction siblings.
 
 Architecture (mirrors the sibling skeleton):
 
@@ -19,8 +19,8 @@ Architecture (mirrors the sibling skeleton):
             {entries: [{id, bol_text}]}
                                            |
                                            v
-                                      llama-server (:8006, shared server)
-                                      Qwen3.8-27B, CUDA, text mode (--jinja)
+                                      vLLM Server (:8011, shared server)
+                                      Qwen3.6-35B-A3B-NVFP4, continuous batching
 
 The core logic (build_prompt / build_params / estimate_tokens / check_context /
 extract_json / lookup_customer / _normalize_bol / run_extract /
@@ -51,28 +51,29 @@ import requests
 # ---------------------------------------------------------------------------
 # Configuration — all values sourced from .env (see .env.example).
 #
-# NOTE: CONTEXT_SIZE and MODEL_PARALLEL mirror the SHARED server's launch flags
-# (Proof-Reader's startserver.sh). They exist here only to compute the local
-# per-slot context budget for the client-side guard and the /healthz cross-check.
+# NOTE: CONTEXT_SIZE mirrors the vLLM server's MAX_MODEL_LEN (32768).
+# It exists here only to compute the local context budget for the
+# client-side guard and the /healthz budget reports. vLLM uses continuous
+# batching -- no slot division.
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "65536"))
-MODEL_PARALLEL = int(os.getenv("MODEL_PARALLEL", "4"))
-MODEL_URL = os.getenv("MODEL_URL", "http://127.0.0.1:8006/v1/chat/completions")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen3.8-27B")
-# Internal bearer token the gateway presents to the shared llama-server. Sent
-# ONLY if non-empty. THIS MUST MATCH the shared server's --api-key, or the
+CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "32768"))
+MODEL_URL = os.getenv("MODEL_URL", "http://127.0.0.1:8011/v1/chat/completions")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen3.6-35B-A3B-NVFP4")
+# Internal bearer token the gateway presents to the shared vLLM server.
+# Sent ONLY if non-empty. THIS MUST MATCH the shared server's --api-key, or the
 # server rejects the call with a 401 (the gateway then returns a 503 on every
-# extract). The shared server is started with --api-key sk-internal-proofreader.
-LLAMA_SERVER_API_KEY = os.getenv("LLAMA_SERVER_API_KEY", "sk-internal-proofreader")
+# extract). The shared server is started by DGXSpark_Setup/vllm-qwen/startserver.sh
+# with --api-key test_key_0000.
+LLAMA_SERVER_API_KEY = os.getenv("LLAMA_SERVER_API_KEY", "test_key_0000")
 # Greedy decoding (temp=0) for run-to-run determinism on factual document
 # extraction.
 MODEL_TEMP = float(os.getenv("MODEL_TEMP", "0.0"))
 MODEL_TOP_P = float(os.getenv("MODEL_TOP_P", "0.5"))
 MODEL_TOP_K = int(os.getenv("MODEL_TOP_K", "40"))
 MODEL_MAX_TOKENS = max(64, int(os.getenv("MODEL_MAX_TOKENS", "4096")))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
 DISABLE_THINKING = os.getenv("DISABLE_THINKING", "1").lower() == "1"
 # Client-side context guard:
 #   strict (default) -> reject over-budget requests with a 422 + guidance
@@ -94,10 +95,10 @@ VERSION = "J2.1"
 
 # Tokens reserved beyond the output budget as headroom (safety margin).
 _SAFETY_MARGIN = 256
-# Degradation levels for chat-template / reasoning suppression.
-# Level 0 = full params, level 1 drops chat_template_kwargs,
-# level 2 drops reasoning_effort on top of level 1.
-_PARAMS_LEVELS = (0, 1, 2)
+# Degradation levels for chat-template / reasoning suppression (vLLM-native).
+# Level 0 = full params with chat_template_kwargs:{enable_thinking:false}
+# Level 1 = strip chat_template_kwargs (retry if server rejects).
+_PARAMS_LEVELS = (0, 1)
 # Last known-working degradation level, cached to avoid retrying on every call.
 _PARAMS_LEVEL = 0
 
@@ -348,7 +349,7 @@ def build_prompt(bol_text: str, customer_table: list[dict]) -> list[dict]:
     ]
 
 
-# --- Thinking-suppression degradation chain -------------------------------
+# --- Thinking-suppression degradation chain (vLLM-native, 2-level) --------
 def _base_params() -> dict:
     """Fixed sampling parameters (independent of degradation level)."""
     return {
@@ -363,16 +364,17 @@ def _base_params() -> dict:
 
 
 def build_params(level: int = 0) -> dict:
-    """Full (level-0) sampling parameters with thinking suppression.
+    """Sampling parameters with vLLM-native thinking suppression.
 
-    Level 0 includes both ``reasoning_effort`` (if DISABLE_THINKING) and
-    ``chat_template_kwargs: {enable_thinking: false}``. Higher levels are
-    derived by :func:`_params_at_level` (dropping fields the server rejected).
+    vLLM path: only ``chat_template_kwargs: {enable_thinking: False}``.
+    (No ``reasoning_effort`` — that is llama.cpp-specific.)
+
+    Supports 2-level degradation (level 0 = with chat_template_kwargs,
+    level 1 = without, retried if the server rejected the param).
     """
     params = _base_params()
     if not DISABLE_THINKING:
         return params
-    params["reasoning_effort"] = 0
     if level == 0:
         params["chat_template_kwargs"] = {"enable_thinking": False}
     return params
@@ -383,12 +385,10 @@ def _params_at_level(params: dict, level: int) -> dict:
     out = dict(params)
     if level >= 1:
         out.pop("chat_template_kwargs", None)
-    if level >= 2:
-        out.pop("reasoning_effort", None)
     return out
 
 
-# --- Client-side context guard --------------------------------------------
+# --- Client-side context guard (vLLM -- continuous batching, no slots) -----
 def estimate_tokens(text: str) -> int:
     """Conservative token heuristic (chars/3, ceiling). Dense B/L text runs
     low, so erring high avoids false rejections."""
@@ -401,22 +401,18 @@ def _estimate_prompt_tokens(messages: list[dict]) -> int:
     return sum(estimate_tokens(m.get("content", "")) for m in messages)
 
 
-def slot_budget() -> int:
-    """Tokens available for a single request's prompt in one slot.
-
-    llama.cpp divides its total ``--ctx-size`` across ``--parallel`` slots, so
-    the per-slot budget is ``CONTEXT_SIZE // MODEL_PARALLEL``.
-    """
-    return max(1, CONTEXT_SIZE // MODEL_PARALLEL)
-
-
 def usable_prompt_room() -> int:
-    """Slot budget minus reserved output headroom minus safety margin."""
-    return max(0, slot_budget() - MODEL_MAX_TOKENS - _SAFETY_MARGIN)
+    """Tokens available for the entire prompt in the vLLM context window.
+
+    vLLM uses continuous batching -- no slot division. The full
+    ``CONTEXT_SIZE`` (= MAX_MODEL_LEN on the server) is the budget.
+    """
+    return max(0, CONTEXT_SIZE - MODEL_MAX_TOKENS - _SAFETY_MARGIN)
 
 
 def check_context(messages: list[dict]) -> None:
-    """Reject before any network call if the prompt cannot fit in a slot.
+    """Reject before any network call if the prompt cannot fit in the vLLM
+    context window.
 
     Honors CONTEXT_GUARD: ``strict`` raises ``ContextGuardExceeded`` (422),
     ``warn`` logs a warning and allows, ``off`` skips entirely.
@@ -429,19 +425,18 @@ def check_context(messages: list[dict]) -> None:
         return
     if CONTEXT_GUARD == "warn":
         logger.warning(
-            "Estimated prompt size %d exceeds slot budget %d; allowing request anyway.",
+            "Estimated prompt size %d tokens exceeds vLLM context budget %d; "
+            "allowing request anyway.",
             est, room,
         )
         return
     raise ContextGuardExceeded(
-            f"Estimated prompt size {est} tokens exceeds the gateway slot budget "
-            f"{room} tokens (CONTEXT_SIZE={CONTEXT_SIZE}, MODEL_PARALLEL={MODEL_PARALLEL}, "
-            f"max_tokens={MODEL_MAX_TOKENS}, safety margin {_SAFETY_MARGIN}). "
-            f"Per-token slot budget = CONTEXT_SIZE // MODEL_PARALLEL = {slot_budget()} tokens. "
-            f"To proceed on the DGX: re-provision the shared llama-server with a larger "
-            f"--ctx-size (e.g. 131072) and lower --parallel (e.g. 2), then set "
-            f"CONTEXT_SIZE={CONTEXT_SIZE} and MODEL_PARALLEL={MODEL_PARALLEL} in .env to match "
-            f"and restart the gateway. Or submit a shorter B/L document."
+            f"Estimated prompt size {est} tokens exceeds the vLLM context budget "
+            f"{room} tokens (CONTEXT_SIZE={CONTEXT_SIZE}, max_tokens={MODEL_MAX_TOKENS}, "
+            f"safety margin {_SAFETY_MARGIN}). "
+            f"To proceed on the DGX: increase the vLLM server's --max-model-len "
+            f"(e.g. 65536) and set CONTEXT_SIZE in .env to match, or submit a "
+            f"shorter B/L document."
         )
 
 
@@ -621,14 +616,14 @@ def run_extract_batch(entries: list, customer_table: list[dict],
 
 
 # ===========================================================================
-# MODEL BACKEND  (HTTP to the local llama.cpp server — used on the DGX)
+# MODEL BACKEND  (HTTP to the shared vLLM server — used on the DGX)
 # ===========================================================================
 def _resolve_content(message: dict) -> str:
     """Return the model's text from the first non-empty field.
 
-    Qwen3.8-27B is an adaptive thinking model: for hard inputs it may leave
-    ``content`` empty and put the answer in ``reasoning_content`` (or a legacy
-    name). We fall back across those fields, logging a warning when a reasoning
+    Qwen3.6-35B-A3B-NVFP4 is an adaptive thinking model: for hard inputs it
+    may leave ``content`` empty and put the answer in ``reasoning_content``.
+    We fall back across those fields, logging a warning when a reasoning
     field actually carried the text (thinking leaked despite suppression).
     """
     content = message.get("content") or ""
@@ -642,69 +637,112 @@ def _resolve_content(message: dict) -> str:
     raise ModelUnavailable("Model returned an empty response.")
 
 
-def _post(body: dict, headers: dict) -> requests.Response:
+# --- Async HTTP backend (httpx.AsyncClient) --------------------------------
+async def _post_async(body: dict, headers: dict) -> dict:
+    """Async POST to the vLLM OpenAI-compatible endpoint.
+
+    Returns the parsed JSON response body.
+    Logs vLLM usage tokens (prompt_tokens, completion_tokens) and elapsed time.
+    """
+    import httpx
+
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(MODEL_URL, json=body, headers=headers)
+
     try:
-        return requests.post(MODEL_URL, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException as exc:
-        # Connection refused / timeout / DNS etc. → model is unavailable (503).
-        raise ModelUnavailable(f"Model server unreachable: {exc}") from exc
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        raise ModelUnavailable(f"vLLM returned non-JSON response ({resp.status_code}): {resp.text[:300]}")
+
+    # Log vLLM usage tokens for observability.
+    usage = data.get("usage", {})
+    logger.info(
+        "vLLM usage | prompt_tokens=%s completion_tokens=%s elapsed=%.2fs",
+        usage.get("prompt_tokens", "?"),
+        usage.get("completion_tokens", "?"),
+        getattr(resp, "elapsed", 0),
+    )
+    return data
+
+
+# --- Sync wrapper for injectable model_call interface -----------------------
+def _run_async(coro):
+    """Run an async coroutine from synchronous code (used by the sync
+    ``model_call`` callable interface)."""
+    try:
+        import anyio
+    except ImportError:
+        anyio = None
+    if anyio is not None:
+        return anyio.run(coro)
+    # Fallback: run with a new event loop (no anyio).
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def http_model_call(messages: list[dict], params: dict = None) -> str:
-    """POST a chat completion to the llama.cpp OpenAI-compatible endpoint.
+    """POST a chat completion to the vLLM OpenAI-compatible endpoint.
 
-    Implements the thinking-suppression degradation chain: try full params
-    (level 0), then drop chat_template_kwargs (level 1), then drop
-    reasoning_effort too (level 2). The first working level is cached so later
-    calls skip straight to it. Context-length rejections map to
-    ``ContextExceeded`` (503); the resolved text is returned as-is for
-    ``extract_json()`` to clean.
+    Implements the vLLM-native thinking-suppression degradation chain:
+    Level 0 = full params with ``chat_template_kwargs:{enable_thinking:false}``,
+    Level 1 = strip ``chat_template_kwargs`` (retry if server rejected).
+
+    The first working level is cached in ``_PARAMS_LEVEL`` so later calls
+    skip straight to it. Context-length rejections map to ``ContextExceeded``
+    (503); the resolved text is returned as-is for ``extract_json()`` to clean.
     """
-    global _PARAMS_LEVEL
+    import anyio
 
     if params is None:
         params = {}
+
     headers = {"Authorization": f"Bearer {LLAMA_SERVER_API_KEY}"} if LLAMA_SERVER_API_KEY else {}
 
-    level = _PARAMS_LEVEL
-    while level <= 2:
-        attempt = _params_at_level(params, level)
-        body = {"model": MODEL_NAME, "messages": messages}
-        for key in _SAMPLING_KEYS:
-            if key in attempt:
-                body[key] = attempt[key]
-        if "reasoning_effort" in attempt:
-            body["reasoning_effort"] = attempt["reasoning_effort"]
-        if "chat_template_kwargs" in attempt:
-            body["chat_template_kwargs"] = attempt["chat_template_kwargs"]
+    async def _call_with_degradation():
+        global _PARAMS_LEVEL
+        level = _PARAMS_LEVEL
+        while level <= 1:
+            attempt = _params_at_level(params, level)
+            body = {"model": MODEL_NAME, "messages": messages}
+            for key in _SAMPLING_KEYS:
+                if key in attempt:
+                    body[key] = attempt[key]
+            if "chat_template_kwargs" in attempt:
+                body["chat_template_kwargs"] = attempt["chat_template_kwargs"]
 
-        resp = _post(body, headers)
-        if resp.status_code == 200:
-            _PARAMS_LEVEL = level
-            return _resolve_content(resp.json()["choices"][0]["message"])
+            resp = await _post_async(body, headers)
+            if resp.get("choices"):
+                _PARAMS_LEVEL = level
+                return _resolve_content(resp["choices"][0]["message"])
 
-        detail = resp.text[:300]
-        lowered = detail.lower()
+            detail = resp.get("error", {}).get("message", str(resp)[:300]).lower()
 
-        # Context-length overflow → actionable 503.
-        if "context length" in lowered or ("context" in lowered and any(
-            w in lowered for w in ("exceed", "size", "length", "overflow", "too long"))):
-            raise ContextExceeded(
-                "Request exceeds the model's context window (server ctx is fixed at launch). "
-                "Restart llama-server with a larger --ctx-size and set CONTEXT_SIZE in .env to match."
-            )
+            # Context-length overflow → actionable 503.
+            if "context length" in detail or ("context" in detail and any(
+                w in detail for w in ("exceed", "size", "length", "overflow", "too long"))):
+                raise ContextExceeded(
+                    "Request exceeds the model's context window (server --max-model-len is fixed at launch). "
+                    "Restart vLLM with a larger --max-model-len and set CONTEXT_SIZE in .env to match."
+                )
 
-        # Thinking-suppression degradation: the build rejected a suppression field.
-        if "chat_template_kwargs" in lowered or "reasoning_effort" in lowered:
-            level += 1
-            continue
+            # Thinking-suppression degradation: the server rejected chat_template_kwargs.
+            if "chat_template_kwargs" in detail:
+                level += 1
+                continue
 
-        # Any other non-200 → give up cleanly.
-        raise ModelUnavailable(f"Model server responded {resp.status_code}: {detail}")
+            # Any other non-200 → give up cleanly.
+            raise ModelUnavailable(f"vLLM server responded {resp.get('error', {}).get('code', '?')}: {detail}")
 
-    raise ModelUnavailable(
-        "Model server could not satisfy the request after param degradation."
-    )
+        raise ModelUnavailable(
+            "vLLM server could not satisfy the request after param degradation."
+        )
+
+    return _run_async(_call_with_degradation())
 
 
 # ===========================================================================
@@ -714,8 +752,8 @@ app = FastAPI(
     title="AI MDPL Bill of Lading Extractor API",
     description=(
         "Lean JSON-in / JSON-out Bill of Lading Extractor for the Japan market "
-        "(assistant version J2.1). Runs Qwen3.8-27B locally on the shared NVIDIA "
-        "DGX Spark model server."
+        "(assistant version J2.1). Runs Qwen3.6-35B-A3B-NVFP4 via the shared "
+        "vLLM server on the NVIDIA DGX Spark."
     ),
     version=VERSION,
 )
@@ -771,50 +809,43 @@ async def root():
 
 @app.get("/healthz", tags=["System"])
 async def health_check():
-    """Liveness probe — verifies model-server connectivity and reports the
-    computed per-slot context budget, cross-checked against the server's
-    per-slot n_ctx via /props when available."""
+    """Liveness probe — verifies vLLM server connectivity and reports the
+    configured context budget, cross-checked against the server's
+    --max-model-len via /v1/models when available."""
     model_status = "unreachable"
-    server_ctx_size = None
+    vllm_model_id = None
     try:
         health_url = MODEL_URL.replace("/v1/chat/completions", "/health")
         r = requests.get(health_url, timeout=5)
         if r.status_code == 200:
             model_status = "ready"
+            # Probe vLLM /v1/models to get the served model ID.
+            models_url = MODEL_URL.replace("/v1/chat/completions", "/v1/models")
             try:
-                payload = r.json()
-                server_ctx_size = payload.get("ctx_size") or payload.get("n_ctx")
-            except Exception:  # noqa: BLE001 - health payload is best-effort
-                server_ctx_size = None
+                rm = requests.get(models_url, timeout=5)
+                if rm.status_code == 200:
+                    data = rm.json()
+                    vllm_model_id = data.get("data", [{}])[0].get("id")
+            except Exception:  # noqa: BLE001
+                pass
         else:
             model_status = f"responding (status {r.status_code})"
     except Exception as exc:  # noqa: BLE001 - report any connection issue
         model_status = f"unreachable ({exc})"
 
-    # Cross-check the gateway's assumed slot budget against the server's.
-    slot = slot_budget()
-    ctx_check = "unknown"
-    try:
-        props_url = MODEL_URL.replace("/v1/chat/completions", "/props")
-        rp = requests.get(props_url, timeout=5)
-        if rp.status_code == 200:
-            server_slot = (
-                rp.json().get("default_generation_settings", {}).get("n_ctx")
-            )
-            if server_slot is not None:
-                ctx_check = "match" if server_slot == slot else "mismatch"
-    except Exception:  # noqa: BLE001 - /props is best-effort (depends on build)
-        pass
+    context_room = usable_prompt_room()
 
     return {
         "status": "healthy" if model_status == "ready" else "degraded",
         "model_server": model_status,
         "model_name": MODEL_NAME,
+        "vllm_model_id": vllm_model_id,
         "context_budget": {
-            "slot_tokens": slot,
-            "server_ctx_size": server_ctx_size,
-            "check": ctx_check,
+            "context_size": CONTEXT_SIZE,
+            "prompt_room": context_room,
         },
+        "thinking_disabled": DISABLE_THINKING,
+        "context_guard": CONTEXT_GUARD,
         "customer_table_rows": len(load_customer_table()),
         "version": VERSION,
     }
@@ -878,8 +909,8 @@ if __name__ == "__main__":
     logger.info(f"Model server: {MODEL_URL} ({MODEL_NAME})")
     logger.info(f"DISABLE_THINKING={DISABLE_THINKING} | temp={MODEL_TEMP} | top_p={MODEL_TOP_P}")
     logger.info(
-        f"CONTEXT_SIZE={CONTEXT_SIZE} MODEL_PARALLEL={MODEL_PARALLEL} | slot budget="
-        f"{slot_budget()} tokens | prompt room={usable_prompt_room()} | guard={CONTEXT_GUARD}"
+        f"CONTEXT_SIZE={CONTEXT_SIZE} | prompt room={usable_prompt_room()} tokens | "
+        f"guard={CONTEXT_GUARD}"
     )
     logger.info(f"Customer table rows loaded: {len(load_customer_table())}")
     logger.info(f"Swagger UI: http://{API_HOST}:{API_PORT}/docs")
