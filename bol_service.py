@@ -47,6 +47,7 @@ from typing import Callable, Optional, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Header, Body, status, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -661,11 +662,18 @@ async def _post_async(body: dict, headers: dict) -> dict:
 
     # Log vLLM usage tokens for observability.
     usage = data.get("usage", {})
+    elapsed = getattr(resp, "elapsed", 0)
+    # httpx Response.elapsed is a datetime.timedelta — %.2f needs seconds.
+    if hasattr(elapsed, "total_seconds"):
+        try:
+            elapsed = elapsed.total_seconds()
+        except Exception:  # noqa: BLE001 - never let logging break the request
+            elapsed = 0
     logger.info(
         "vLLM usage | prompt_tokens=%s completion_tokens=%s elapsed=%.2fs",
         usage.get("prompt_tokens", "?"),
         usage.get("completion_tokens", "?"),
-        getattr(resp, "elapsed", 0),
+        elapsed,
     )
     return data
 
@@ -673,18 +681,35 @@ async def _post_async(body: dict, headers: dict) -> dict:
 # --- Sync wrapper for injectable model_call interface -----------------------
 def _run_async(coro):
     """Run an async coroutine from synchronous code (used by the sync
-    ``model_call`` callable interface)."""
+    ``model_call`` callable interface).
+
+    Accepts either a coroutine object (``_call_with_degradation()``) or a
+    zero-arg async callable. ``anyio.run`` requires a *callable*, so a bare
+    coroutine is wrapped first — passing it straight through raises
+    ``TypeError: 'coroutine' object is not callable`` (DGX 500).
+    Must only be called from a worker thread (endpoints use
+    ``run_in_threadpool``); calling from a running event loop raises
+    ``RuntimeError: Already running ...``.
+    """
+    import inspect
+
     try:
         import anyio
     except ImportError:
         anyio = None
     if anyio is not None:
+        if inspect.iscoroutine(coro):
+            async def _await_coro():
+                return await coro
+            return anyio.run(_await_coro)
         return anyio.run(coro)
     # Fallback: run with a new event loop (no anyio).
     import asyncio
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(coro)
+        if inspect.iscoroutine(coro):
+            return loop.run_until_complete(coro)
+        return loop.run_until_complete(coro())
     finally:
         loop.close()
 
@@ -699,9 +724,13 @@ def http_model_call(messages: list[dict], params: dict = None) -> str:
     The first working level is cached in ``_PARAMS_LEVEL`` so later calls
     skip straight to it. Context-length rejections map to ``ContextExceeded``
     (503); the resolved text is returned as-is for ``extract_json()`` to clean.
-    """
-    import anyio
 
+    NOTE: this is a *blocking* sync wrapper (it drives the async vLLM client
+    via ``_run_async``). Async FastAPI endpoints must call it via
+    ``await run_in_threadpool(...)`` so ``anyio.run`` executes in a worker
+    thread with no running event loop — calling it directly from ``async def``
+    raises ``RuntimeError: Already running ... in this thread`` (DGX 500).
+    """
     if params is None:
         params = {}
 
@@ -878,9 +907,11 @@ async def health_check():
         if r.status_code == 200:
             model_status = "ready"
             # Probe vLLM /v1/models to get the served model ID.
+            # vLLM requires the Bearer key here (same as chat completions).
             models_url = MODEL_URL.replace("/v1/chat/completions", "/v1/models")
             try:
-                rm = requests.get(models_url, timeout=5)
+                model_headers = {"Authorization": f"Bearer {LLAMA_SERVER_API_KEY}"} if LLAMA_SERVER_API_KEY else {}
+                rm = requests.get(models_url, headers=model_headers, timeout=5)
                 if rm.status_code == 200:
                     data = rm.json()
                     vllm_model_id = data.get("data", [{}])[0].get("id")
@@ -917,7 +948,8 @@ async def extract(
     """Parse a single B/L document into the J2.1 shipment JSON."""
     table = load_customer_table()
     try:
-        record = run_extract(body.model_dump(), table, http_model_call)
+        # Blocking sync model call -> worker thread (never anyio.run in-loop).
+        record = await run_in_threadpool(run_extract, body.model_dump(), table, http_model_call)
     except ValueError as exc:
         # Includes ContextGuardExceeded (422 with actionable sizing guidance).
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -946,7 +978,8 @@ async def extract_file(
     table = load_customer_table()
     try:
         text = await _read_md_upload(file)
-        record = run_extract({"bol_text": text}, table, http_model_call)
+        # Blocking sync model call -> worker thread (never anyio.run in-loop).
+        record = await run_in_threadpool(run_extract, {"bol_text": text}, table, http_model_call)
     except ValueError as exc:
         # Includes file validation + ContextGuardExceeded (422 with guidance).
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -970,7 +1003,9 @@ async def extract_batch(
     and reported per item; overall status stays 200."""
     table = load_customer_table()
     try:
-        results = run_extract_batch(
+        # Blocking sync batch -> worker thread (never anyio.run in-loop).
+        results = await run_in_threadpool(
+            run_extract_batch,
             [entry.model_dump() for entry in body.entries],
             table,
             http_model_call,
