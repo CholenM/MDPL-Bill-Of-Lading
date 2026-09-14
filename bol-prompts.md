@@ -95,3 +95,7 @@ Design notes:
   extraction.
 - The model's CustomerCode output is advisory only — the gateway re-resolves it
   authoritatively against the live config table after normalization.
+- MD-file ingest (v3.1): `POST /v1/extract_file` decodes the uploaded UTF-8
+  `.md` file to a string and feeds it byte-identical into the same
+  `<<<BOL_DATA>>> ... <<<END_BOL_DATA>>>` fence. No prompt change; markdown
+  syntax (`#`, `|`, `**`) is treated as opaque document text.

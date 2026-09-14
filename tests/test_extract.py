@@ -687,7 +687,7 @@ class TestApiSurface:
         assert r.status_code == 200
         payload = r.json()
         assert payload["version"] == "J2.1"
-        for ep in ("/v1/extract", "/v1/extract_batch", "/v1/version", "/healthz"):
+        for ep in ("/v1/extract", "/v1/extract_file", "/v1/extract_batch", "/v1/version", "/healthz"):
             assert ep in payload["endpoints"]
 
     def test_healthz_degraded_when_model_down(self, client, monkeypatch):
@@ -776,6 +776,96 @@ class TestApiSurface:
     def test_extract_batch_requires_entries(self, client):
         r = client.post("/v1/extract_batch", json={"entries": []}, headers=_auth())
         assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# MD file ingest — POST /v1/extract_file (v3.1)
+# --------------------------------------------------------------------------
+class TestExtractFile:
+    def _golden_bytes(self):
+        with open(os.path.join(CASES, "bol_golden_input.txt"), "rb") as f:
+            return f.read()
+
+    def test_file_happy_path_parity(self, client):
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("ocr.md", self._golden_bytes(), "text/markdown")},
+            headers=_auth(),
+        )
+        assert r.status_code == 200
+        assert r.json() == _golden()
+
+    def test_file_txt_extension_ok(self, client):
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("ocr.txt", self._golden_bytes(), "text/plain")},
+            headers=_auth(),
+        )
+        assert r.status_code == 200
+
+    def test_file_missing_401(self, client):
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("ocr.md", self._golden_bytes(), "text/markdown")},
+        )
+        assert r.status_code == 401
+
+    def test_file_missing_field_422(self, client):
+        r = client.post("/v1/extract_file", data={}, headers=_auth())
+        assert r.status_code == 422
+
+    def test_file_wrong_extension_422(self, client):
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("scan.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            headers=_auth(),
+        )
+        assert r.status_code == 422
+
+    def test_file_empty_422(self, client):
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("empty.md", b"   ", "text/markdown")},
+            headers=_auth(),
+        )
+        assert r.status_code == 422
+
+    def test_file_non_utf8_422(self, client):
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("bad.md", b"\xff\xfe\x00bad", "text/markdown")},
+            headers=_auth(),
+        )
+        assert r.status_code == 422
+
+    def test_file_oversize_422(self, client, monkeypatch):
+        monkeypatch.setattr(bol, "CONTEXT_SIZE", 4096)
+        monkeypatch.setattr(bol, "MODEL_MAX_TOKENS", 64)
+        monkeypatch.setattr(bol, "CONTEXT_GUARD", "strict")
+        huge = b"x" * 20000
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("huge.md", huge, "text/markdown")},
+            headers=_auth(),
+        )
+        assert r.status_code == 422
+
+    def test_file_503_on_bad_model(self, client, monkeypatch):
+        monkeypatch.setattr(bol, "http_model_call", lambda m, p: "no JSON here at all")
+        r = client.post(
+            "/v1/extract_file",
+            files={"file": ("ocr.md", self._golden_bytes(), "text/markdown")},
+            headers=_auth(),
+        )
+        assert r.status_code == 503
+
+    def test_get_on_file_405(self, client):
+        r = client.get("/v1/extract_file")
+        assert r.status_code == 405
+
+    def test_get_on_extract_405_regression(self, client):
+        r = client.get("/v1/extract")
+        assert r.status_code == 405
 
 
 # --------------------------------------------------------------------------

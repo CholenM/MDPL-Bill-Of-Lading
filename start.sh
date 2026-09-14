@@ -27,10 +27,10 @@ if [ ! -d "$SCRIPT_DIR/.venv" ]; then
 fi
 source "$SCRIPT_DIR/.venv/bin/activate"
 
-if ! python -c "import fastapi, requests, dotenv, httpx" >/dev/null 2>&1; then
+if ! python -c "import fastapi, requests, dotenv, httpx, multipart" >/dev/null 2>&1; then
     echo -e "${CYAN}[1/3] Installing runtime dependencies...${NC}"
-    pip install --upgrade pip -q
-    pip install -r "$SCRIPT_DIR/requirements.txt" -q
+    python -m pip install --upgrade pip -q
+    python -m pip install -r "$SCRIPT_DIR/requirements.txt" -q
 fi
 
 # ---------------------------------------------------------------------------

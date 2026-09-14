@@ -1,9 +1,13 @@
-# MDPL Bill of Lading Extractor — v2.1 to v3 vLLM Migration Roadmap
+# MDPL Bill of Lading Extractor — MD-File Ingest Roadmap (v3.1)
 
-> Source of truth for the Builder. This document describes the migration from
-> llama.cpp (`:8006`, Qwen3.8-27B) to the shared vLLM server
-> (`:8011`, Qwen3.6-35B-A3B-NVFP4), following the proven pattern from
-> Proof-Reader, GDS Extraction, and QA-Manager.
+> **Source of Truth for the Builder.** This document replans the system after the
+> `GET /v1/extract → 405` incident and the OCR-team decision:
+> **pipeline is `PDF → OCR (separate system) → OCR output as `.md` text file → BOL extractor`.**
+> Our gateway **must receive an `.md` file** (single, small, UTF-8).
+>
+> Prior doc (v2.1 → v3 vLLM migration) is superseded for API scope but remains
+> valid for backend (vLLM `:8011`, `Qwen3.6-35B-A3B-NVFP4`, 2-level degradation,
+> continuous batching). Do not regress it.
 
 ---
 
@@ -11,270 +15,315 @@
 
 ### 1.1 Objectives
 
-Migrate the MDPL Bill of Lading Extractor FastAPI gateway from a synchronous
-`requests.post()` call to llama.cpp's OpenAI-compatible API (`:8006`) to an
-asynchronous `httpx.AsyncClient` call to the shared vLLM server (`:8011`).
-
-The business logic (prompt building, customer lookup, JSON extraction,
-normalization, context guard, batch orchestration, API routes) remains
-**untouched** — only the model backend layer changes.
+1. **Explain and close the 405:** `GET /v1/extract` is *correct* `405 Method Not Allowed`
+   — route is `POST`-only by design (`bol_service.py:854`). No GET handler will be added.
+   Fix is client-side + docs.
+2. **Support hardwired OCR handoff:** add `POST /v1/extract_file` accepting
+   `multipart/form-data` with a single `.md` (allow `.txt`/`.markdown` alias) file,
+   UTF-8, small. Reuse the exact same pure pipeline (`run_extract` →
+   `extract_json` → `_normalize_bol` → `lookup_customer`) so J2.1 output is
+   bit-identical to `POST /v1/extract`.
+3. **Preserve backward compatibility:** keep `POST /v1/extract` (`{bol_text}`),
+   `POST /v1/extract_batch`, `POST /v1/version`, `GET /healthz`, `GET /` unchanged
+   in behavior. Only `GET /` endpoint list grows by one entry.
+4. **Stay gateway-only:** never start/stop the shared vLLM server (`:8011`).
+   No model, port, or schema change.
 
 ### 1.2 Architecture (Before → After)
 
+**Before (v3 JSON-only — causes 405 + 422 for file-uploaders):**
+
+```text
+PDF → [external OCR system] → ocr_output.md (on OCR host)
+                                          |
+                     GET /v1/extract  →  405 (no GET route)
+              POST text/plain --data-binary @ocr.md → 422 (no JSON body)
+              POST -F file=@ocr.md → 422 (no bol_text field)
+              POST JSON {"bol_text": "<md contents>"} → 200 (only working path)
 ```
-BEFORE (llama.cpp):
-  Client → FastAPI gateway (:8086) → requests.post() → llama-server (:8006)
-  Qwen3.8-27B · ctx=65536 · parallel=4 · slot=16384
 
-AFTER (vLLM):
-  Client → FastAPI gateway (:8086) → httpx.AsyncClient → vLLM (:8011)
-  Qwen3.6-35B-A3B-NVFP4 · MAX_MODEL_LEN=32768 · continuous batching · budget=32768
+**After (v3.1 — both paths work, same core):**
+
+```mermaid
+flowchart LR
+    PDF[PDF Bill of Lading] --> OCR[External OCR System<br/>separate, owned by colleague]
+    OCR --> MD[ocr_output.md<br/>single small UTF-8]
+    MD -->|Option A: JSON wrapper<br/>client reads file to string| JSON[POST /v1/extract<br/>application/json {bol_text}]
+    MD -->|Option B: direct file<br/>hardwired uploader| FILE[POST /v1/extract_file<br/>multipart/form-data file=.md]
+    JSON --> GW[FastAPI Gateway :8086<br/>bol_service.py]
+    FILE --> GW
+    GW -->|run_extract same path| VLLM[vLLM :8011<br/>Qwen3.6-35B-A3B-NVFP4]
+    VLLM --> OUT[J2.1 shipment JSON]
 ```
 
-### 1.3 v3 Change Summary
+**Request flow inside gateway (both endpoints converge):**
 
-| Aspect | Before (v2 / llama.cpp) | After (v3 / vLLM) |
-|---|---|---|
-| HTTP client | `requests.post()` (sync blocking) | `httpx.AsyncClient` (async) + `ThreadPoolExecutor` fallback for `model_call` |
-| Model server | `:8006` (Qwen3.8-27B) | `:8011` (Qwen3.6-35B-A3B-NVFP4) |
-| Context size | `CONTEXT_SIZE=65536`, `MODEL_PARALLEL=4` → 16384/slot | `CONTEXT_SIZE=32768`, continuous batching → full 32768 budget |
-| Context guard error | References "slot budget" / `CONTEXT_SIZE // MODEL_PARALLEL` | References "vLLM context budget" (no slots) |
-| Thinking suppression | 3-level chain: `reasoning_effort` → `chat_template_kwargs` → nothing | 2-level: `chat_template_kwargs` → nothing |
-| Degradation levels | `_PARAMS_LEVELS = (0, 1, 2)` | `_PARAMS_LEVELS = (0, 1)` |
-| `MODEL_PARALLEL` | Defined, used in slot budget math | **Removed** (not needed for continuous batching) |
-| Health endpoint | `/health` + `/props` (llama.cpp-specific) | `/health` + `/v1/models` (vLLM OpenAI-compatible) |
-| Timeout | `300s` | `120s` (vLLM is faster) |
-| API key | `sk-internal-proofreader` | `test_key_0000` |
-| Degradation loop | `while level <= 2` | `while level <= 1` |
-| Server overflow error | `ContextExceeded` (503, from response body analysis) | `ContextExceeded` (503, from vLLM 400 response body analysis) |
+```text
+POST /v1/extract         ─┐
+  {bol_text: str}         ├─→ load_customer_table() → run_extract({bol_text}, table, http_model_call)
+POST /v1/extract_file    ─┘         ↑                                              ↑
+  file: UploadFile (.md) ── _read_md_upload() ── {bol_text: decoded str} ─────────┘
+                                                    (build_prompt → check_context → model_call → extract_json)
+```
 
-### 1.4 Constraints (from Interrogation)
+### 1.3 API Definitions
 
-- **Context budget: 16k** — The vLLM server runs at `MAX_MODEL_LEN=32768`.
-  For this project, the client-side guard will use `CONTEXT_SIZE=32768`
-  (matching the server limit) but the *business allocation* is 16k per the
-  Toby/GDMS context plan. The guard ensures no single prompt exceeds the
-  server's 32k window, preventing vLLM strain during cross-system concurrency.
-- **`MODEL_PARALLEL` removed** — vLLM uses continuous batching; no slot division.
-- **2-level degradation only** — vLLM-native `chat_template_kwargs` with
-  single-level retry (no `reasoning_effort`).
-- **Strict client-side rejection** — Over-budget prompts return HTTP 422
-  *before* any vLLM call, protecting shared server capacity.
-- **120s timeout** — vLLM is faster than llama.cpp.
-- **API key: `test_key_0000`** — Matches the shared vLLM server's auth token.
-- **Port remains `8086`** — No change for ease of access.
-- **Model name: `Qwen3.6-35B-A3B-NVFP4`** — The vLLM-served model.
+All endpoints require `x-api-key` header except `GET /` and `GET /healthz`.
+Interactive docs at `/docs`. `GET /v1/extract*` intentionally does **not** exist.
 
-### 1.5 Edge Cases & Failure Modes
+| Endpoint | Method | Request | Success | Notes |
+|---|---|---|---|---|
+| `/` | GET | — | `200 {service, version, endpoints, docs}` | Add `/v1/extract_file` to `endpoints` list |
+| `/healthz` | GET | — | `200 {status, model_server, ..., version}` | Unchanged |
+| `/v1/extract` | POST | `application/json {"bol_text": string(min 1)}` | `200 J2.1 JSON` | Unchanged; `GET` → `405` (expected) |
+| `/v1/extract_file` | **POST (NEW)** | `multipart/form-data` single field `file: (.md/.txt/.markdown)` UTF-8, non-empty, size-capped | `200 J2.1 JSON` (identical schema) | New; `GET` → `405` (expected) |
+| `/v1/extract_batch` | POST | `{"entries": [{id?, bol_text}]}` | `200 {results: [{id, status, data/error}]}` | Unchanged |
+| `/v1/version` | POST | — | `200 {"version": "J2.1"}` | Unchanged; `GET` → `405` (expected) |
+
+**NEW `POST /v1/extract_file` contract:**
+
+```bash
+# happy path
+curl -s http://127.0.0.1:8086/v1/extract_file \
+  -H "x-api-key: $KEY" \
+  -F "file=@ocr_output.md;type=text/markdown"
+# → 200 + J2.1 JSON (same shape as /v1/extract)
+
+# PowerShell (OCR host)
+Invoke-RestMethod -Uri "$BASE/v1/extract_file" -Method Post `
+  -Headers @{"x-api-key"=$KEY} -Form @{file=Get-Item ./ocr_output.md}
+```
+
+Server behavior:
+
+1. Require field name exactly `file` (FastAPI `File(...)` → missing → `422`).
+2. Validate extension allowlist: `.md`, `.markdown`, `.txt` (case-insensitive).
+   Reject others → `422 detail: "Unsupported file type ..."`.
+3. Size guard: `MAX_UPLOAD_CHARS = usable_prompt_room() * 3` chars
+   (≈ `28216*3 = 84648` chars at defaults). Reject larger → `422` with same
+   guidance style as `ContextGuardExceeded`. No new `.env` var (derived, avoids
+   config-drift test churn).
+4. Decode `await file.read()` as UTF-8 strict. On `UnicodeDecodeError` →
+   `422 detail: "File must be UTF-8 ..."`. No `shift_jis` fallback (per
+   interrogation: single small UTF-8 only; add fallback only if later proven needed).
+5. Strip; reject empty/whitespace-only → `422`.
+6. Call `run_extract({"bol_text": text}, table, http_model_call)` — identical
+   downstream: `check_context` (`422`), `ModelUnavailable`/`ContextExceeded` (`503`),
+   unexpected (`500`). Log `filename + char count` (never file contents at INFO).
+
+### 1.4 Data Schemas
+
+**J2.1 output (unchanged, `_normalize_bol` is authoritative):**
+
+```json
+{
+  "AssistantVersion": "J2.1",
+  "BLNumber": "string",
+  "BLDate": { "Month": 0, "Day": 0, "Year": 0 },
+  "CustomerName": "string",
+  "CustomerCode": "string",
+  "CustomerAddress": "string",
+  "Shipper": "string",
+  "ShipperAddress": "string",
+  "ShipToDestination": { "City": "string", "Country": "string" },
+  "ShipVia": "string",
+  "VoyageNumber": "string",
+  "Brand": "string",
+  "PortOfOrigin": "string",
+  "Cartons": 0
+}
+```
+
+Placeholders per spec §6: `"N/A"` strings, `0` numerics, `AssistantVersion` always
+`"J2.1"`. Gateway `lookup_customer` overrides model `CustomerCode`.
+
+**Inputs:**
+
+```python
+# existing — unchanged
+class ExtractRequest(BaseModel):
+    bol_text: str = Field(..., min_length=1)
+
+# new — NOT a pydantic model; FastAPI UploadFile signature:
+# async def extract_file(file: UploadFile = File(...), _api_key: str = Depends(verify_api_key))
+# validation lives in helper _read_md_upload(file) -> str
+```
+
+`.md` contents are opaque text (markdown `#`, `|`, `**` harmless inside
+`<<<BOL_DATA>>>...<<<END_BOL_DATA>>>` fencing in `build_prompt`).
+
+### 1.5 Constraints (from Interrogation + Debugger RCA)
+
+- **C1. POST-only is intentional.** `GET /v1/extract`, `GET /v1/extract_file`,
+  `GET /v1/version` must all remain `405`. Reason: GET cannot carry `bol_text`
+  reliably (no body semantics, URL length 2–8k, PII in logs/cache). Fix is client
+  uses POST; docs must state this explicitly (closes 405 confusion).
+- **C2. Input is single small UTF-8 `.md`.** No PDF/image bytes to this gateway
+  (OCR is upstream, separate system). No batch-file endpoint in v3.1; batch
+  callers use existing `POST /v1/extract_batch` with strings.
+- **C3. Reuse, don't fork.** `POST /v1/extract_file` must call `run_extract`
+  (same `build_prompt`/`check_context`/`extract_json`/`lookup_customer`). No
+  duplicate prompt logic, no schema fork.
+- **C4. Gateway-only, shared vLLM.** No change to `MODEL_URL (:8011)`,
+  `MODEL_NAME (Qwen3.6-35B-A3B-NVFP4)`, `CONTEXT_SIZE (32768)`, `API_PORT (8086)`,
+  `REQUEST_TIMEOUT (120)`, 2-level `chat_template_kwargs` degradation.
+- **C5. Backward compatible.** Existing clients/tests for `/v1/extract` keep
+  passing untouched. `test_defaults_sync_to_env_example` must keep passing
+  (hence no new required `.env` var).
+- **C6. Auth + status ladder preserved:** `GET wrong method → 405` (before auth);
+  `POST no/bad key → 401`; `POST bad body/file → 422`; `POST good but guard/model
+  fail → 422/503`; unexpected → `500`. New endpoint mirrors this exactly.
+- **C7. Dependency minimal:** only add `python-multipart` (required by Starlette
+  `UploadFile` form parsing). `httpx`, `requests`, `fastapi`, `uvicorn` unchanged.
+- **C8. Windows-dev testable:** full suite passes on Windows with stub
+  `http_model_call` (no GPU/vLLM), same as today (`pytest -v`).
+
+### 1.6 Edge Cases & Failure Modes
 
 | Scenario | Handling |
 |---|---|
-| vLLM server unreachable / timeout | `ModelUnavailable` → HTTP 503 |
-| Prompt exceeds vLLM 32k context window | `ContextExceeded` → HTTP 503 (server-side, from response body) |
-| Prompt exceeds client-side guard budget | `ContextGuardExceeded` → HTTP 422 (before any network call) |
-| vLLM rejects `chat_template_kwargs` | Retry at level 1 (without the param); cached for subsequent calls |
-| vLLM returns empty content | `ModelUnavailable` → HTTP 503 |
-| Batch entry fails | Per-entry error recorded; overall 200 with `"status": "error"` |
-| vLLM not ready (JIT boot) | Pre-flight waits up to 300s (vLLM needs up to 15min for FlashInfer JIT) |
-| Context budget mismatch detection | `/healthz` reports `context_budget` from vLLM `--max-model-len` |
+| `GET /v1/extract` or `GET /v1/extract_file` | `405 Method Not Allowed` + `Allow: POST` (Starlette default). Documented as expected; triage: use POST. |
+| Missing `file` field / wrong field name | `422` (FastAPI validation). |
+| Wrong extension (`.pdf`, `.png`, `.docx`, no ext) | `422 "Unsupported file type ... use .md/.txt"`. Never sniff/convert PDF. |
+| Empty file (0 bytes) or whitespace-only `.md` | `422` (mirrors `min_length=1` + `run_extract` whitespace check). |
+| Non-UTF-8 bytes | `422 "File must be UTF-8 ..."`. No silent mojibake. |
+| Oversized `.md` (> `usable_prompt_room()*3` chars) | `422` before any model call, with sizing guidance (mirrors `ContextGuardExceeded`; strict/warn/off honors `CONTEXT_GUARD`). |
+| Prompt still over budget after file passes size cap (system prompt + table overhead) | `422` from existing `check_context` (strict) — defense in depth. |
+| vLLM down / timeout / unparseable JSON | `503` via existing `ModelUnavailable`/`ContextExceeded` mapping. |
+| Missing/invalid `x-api-key` on new endpoint | `401` via existing `verify_api_key`. |
+| Markdown syntax / Japanese / newlines in `.md` | Harmless; passed verbatim inside `<<<BOL_DATA>>>` fences. |
+| Filename with path traversal / weird chars | Ignored except for logging + extension check; never written to disk. |
+| Large `filename` log injection | Log filename only, sanitized to basename, at INFO; never log file contents. |
 
 ---
 
 ## 2. The Execution Roadmap (Task List)
 
-### Phase A: Configuration & Dependencies
+> Sequential. Each item atomic + verifiable. Do not skip verification phases.
+> All paths absolute to repo root `E:\Projects\MDPL-Bill-Of-Lading`.
 
-- [ ] **A1.** Update `.env.example`: change `MODEL_URL` to `:8011`, `MODEL_NAME` to
-      `Qwen3.6-35B-A3B-NVFP4`, `CONTEXT_SIZE` to `32768`, remove `MODEL_PARALLEL`,
-      change `LLAMA_SERVER_API_KEY` to `test_key_0000`, `REQUEST_TIMEOUT` to `120`.
-      Update all comments to reflect vLLM, not llama.cpp.
+### Phase A: Dependencies & Config
 
-- [ ] **A2.** Update `requirements.txt`: add `httpx>=0.27` to runtime deps (it's
-      currently only in dev). Keep `requests>=2.31` for the `/healthz` and
-      pre-flight probes (will be cleaned up later if needed).
+- [ ] **A1.** Add `python-multipart>=0.0.9` to `requirements.txt` runtime deps
+      (after `httpx` line). Verify: `pip install -r requirements.txt` succeeds on
+      Windows; `python -c "import multipart"` passes.
+- [ ] **A2.** Verify no `.env.example` change needed (no new var; upload cap is
+      derived). Verify: `test_defaults_sync_to_env_example` still passes unmodified.
 
-### Phase B: Core Service Rewrite (`bol_service.py`)
+### Phase B: Core Service (`bol_service.py` — in-place edits only)
 
-- [ ] **B1.** Update module docstring (lines 1-34): replace llama.cpp references
-      with vLLM, update architecture diagram, update model name to
-      `Qwen3.6-35B-A3B-NVFP4`.
+- [ ] **B1.** Imports: add `UploadFile`, `File` to the existing
+      `from fastapi import ...` import (line 45). Verify: `python -c "import bol_service"` passes.
+- [ ] **B2.** Implement helper `_read_md_upload(file: UploadFile) -> str` (place
+      just above `# --- Endpoints ---`, ~line 799):
+      - `ALLOWED_EXTS = {".md", ".markdown", ".txt"}` (lowercased suffix check via `os.path.splitext`).
+      - Read `await file.read()`; enforce `len(bytes) <= usable_prompt_room()*3` (bytes ≈ chars pre-decode; cheap pre-check) else raise `ValueError` with sizing guidance.
+      - Decode UTF-8 strict; `UnicodeDecodeError` → `ValueError("File must be UTF-8-encoded markdown ...")`.
+      - Enforce decoded `len(text) <= usable_prompt_room()*3` else `ValueError`.
+      - Reject empty/whitespace-only → `ValueError("'bol_text' must be a non-empty string." style message)`.
+      - Return decoded `str`. Pure async helper, no model call.
+      - Verify: unit-importable; manual stub test with fake `UploadFile`.
+- [ ] **B3.** Implement `POST /v1/extract_file` endpoint (place immediately after
+      existing `extract()` at ~line 872, before `extract_batch`):
+      ```python
+      @app.post("/v1/extract_file", response_class=JSONResponse, tags=["Extract"])
+      async def extract_file(_api_key: str = Depends(verify_api_key), file: UploadFile = File(...)):
+          table = load_customer_table()
+          try:
+              text = await _read_md_upload(file)
+              record = run_extract({"bol_text": text}, table, http_model_call)
+          except ValueError as exc:
+              raise HTTPException(status_code=422, detail=str(exc))
+          except (ModelUnavailable, ContextExceeded) as exc:
+              raise HTTPException(status_code=503, detail=str(exc))
+          except Exception:
+              logger.error("Unexpected extract_file error", exc_info=True)
+              raise HTTPException(status_code=500, detail="Processing failed.")
+          return JSONResponse(content=record)
+      ```
+      - Log `filename + chars` on success (basename only).
+      - Verify: `/docs` shows the endpoint; `GET /v1/extract_file` returns `405`.
+- [ ] **B4.** Update `root()` (`@app.get("/")` ~line 800) `endpoints` list to include
+      `"/v1/extract_file"`. Verify: `TestClient.get("/").json()["endpoints"]` contains it.
+- [ ] **B5.** Update module docstring (lines 1–34) + FastAPI `description`
+      (~line 753): note both `POST /v1/extract (JSON)` and
+      `POST /v1/extract_file (.md upload)` converge on same pipeline; restate
+      `GET → 405 by design`. Verify: visual diff only, no logic change.
 
-- [ ] **B2.** Configuration block (lines 58-96):
-      - Change `CONTEXT_SIZE` default to `"32768"`.
-      - **Remove `MODEL_PARALLEL` entirely** (delete lines 61 and all references).
-      - Change `MODEL_URL` default to `"http://127.0.0.1:8011/v1/chat/completions"`.
-      - Change `MODEL_NAME` default to `"Qwen3.6-35B-A3B-NVFP4"`.
-      - Change `LLAMA_SERVER_API_KEY` default to `"test_key_0000"`.
-      - Change `REQUEST_TIMEOUT` default to `"120"`.
-      - Rename variable `LLAMA_SERVER_API_KEY` → `VLLM_API_KEY` (update all refs).
+### Phase C: Tests (`tests/test_extract.py` — append, never weaken existing)
 
-- [ ] **B3.** Degradation levels (lines 97-102):
-      - Change `_PARAMS_LEVELS = (0, 1, 2)` → `_PARAMS_LEVELS = (0, 1)`.
-      - Update the inline comment to describe vLLM-native 2-level chain.
+- [ ] **C1.** Add `TestExtractFile` class (stub backend via existing `client` fixture):
+      - `test_file_happy_path_parity`: POST golden `.txt` bytes as
+        `files={"file": ("ocr.md", open(cases/bol_golden_input.txt,"rb"), "text/markdown")}`
+        with auth → `200` + body == `_golden()` (parity with `/v1/extract`).
+      - `test_file_missing_401`: no auth → `401`.
+      - `test_file_missing_field_422`: `data={}` no file → `422`.
+      - `test_file_wrong_extension_422`: `("scan.pdf", b"%PDF", "application/pdf")` → `422`.
+      - `test_file_empty_422`: `("empty.md", b"   ", "text/markdown")` → `422`.
+      - `test_file_non_utf8_422`: `("bad.md", b"\xff\xfe\x00", ...)` → `422`.
+      - `test_file_oversize_422`: monkeypatch tiny budget or post huge payload → `422`.
+      - `test_file_503_on_bad_model`: monkeypatch `http_model_call → "no JSON"` → `503`.
+      - `test_get_on_file_405`: `client.get("/v1/extract_file")` → `405`.
+      - `test_get_on_extract_405_regression`: `client.get("/v1/extract")` → `405` (locks the RCA).
+      - Verify: `pytest tests/test_extract.py -v` all green (existing + ~10 new).
+- [ ] **C2.** Update `test_root_lists_endpoints` (line 685–691) to also assert
+      `"/v1/extract_file"` in payload. Verify: passes.
 
-- [ ] **B4.** `_base_params()` function (lines 352-362): **no change needed** —
-      the sampling params dict is vLLM-compatible as-is.
+### Phase D: Docs (keep code + docs in sync)
 
-- [ ] **B5.** `build_params()` function (lines 365-378):
-      - **Remove `reasoning_effort`** — vLLM doesn't use this parameter.
-      - Keep `chat_template_kwargs: {enable_thinking: False}` only (level 0).
-      - Update docstring to say "vLLM-native, 2-level degradation."
+- [ ] **D1.** `README.md`: add `POST /v1/extract_file` section with `curl` + PowerShell
+      examples; add `GET → 405 is expected, use POST` troubleshooting row in Errors
+      table; add one-line pipeline note `PDF → OCR → .md → POST /v1/extract_file`.
+      Verify: commands copy-paste runnable.
+- [ ] **D2.** `bol-prompts.md`: append one paragraph — file path is byte-identical
+      prompt path (decoded text goes into same `<<<BOL_DATA>>>` fence); no prompt
+      change. Verify: no other edits.
+- [ ] **D3.** (Optional, only if drift found) sync `.env.example` comments to mention
+      `.md` cap derived from `CONTEXT_SIZE`. No new keys. Verify: config-drift test passes.
 
-- [ ] **B6.** `_params_at_level()` function (lines 381-388):
-      - **Remove level 2 logic** (`out.pop("reasoning_effort", None)`).
-      - Keep only level 1: `out.pop("chat_template_kwargs", None)`.
+### Phase E: Verification (DGX + Windows)
 
-- [ ] **B7.** Context guard functions (lines 391-445):
-      - Remove `slot_budget()` function entirely (no slot division in vLLM).
-      - Rewrite `usable_prompt_room()` to use `CONTEXT_SIZE` directly
-        (no division by parallel).
-      - Rewrite `check_context()` error message: remove "slot budget" /
-        `CONTEXT_SIZE // MODEL_PARALLEL` references. Replace with
-        "vLLM context budget" / "vLLM context window."
-      - Update guard to check against 32k (the vLLM server limit), not a
-        per-slot budget.
-
-- [ ] **B8.** `_resolve_content()` function (lines 626-642): **no change needed** —
-      vLLM returns `content` field; fallback chain through
-      `reasoning_content` → `thinking` → `reasoning` → `reason` still works
-      for adaptive-thinking models.
-
-- [ ] **B9.** `_post()` function (lines 645-650): **DELETE** — replacing with
-      async vLLM backend.
-
-- [ ] **B10.** `http_model_call()` function (lines 653-707): **REWRITE**:
-      - Replace `requests.post()` → `httpx.AsyncClient` async POST.
-      - Add sync wrapper using `concurrent.futures.ThreadLoopExecutor` so the
-        existing `Callable[[list, dict], str] model_call` interface is preserved.
-      - Change degradation loop from `while level <= 2` to `while level <= 1`.
-      - Remove `reasoning_effort` from body construction.
-      - Update 400 response body detection: look for `chat_template_kwargs`
-        rejection only (not `reasoning_effort`).
-      - Log vLLM usage tokens (`prompt_tokens`, `completion_tokens`) from
-        response `usage` field.
-
-- [ ] **B11.** FastAPI app docstring (lines 713-719): update model name and
-      vLLM references.
-
-- [ ] **B12.** `/healthz` endpoint (lines 772-820):
-      - Keep `/health` probe for vLLM (same path).
-      - **Remove `/props` probe** — doesn't exist on vLLM.
-      - Add `/v1/models` probe to extract `vllm_model_id`.
-      - Replace `context_budget` → remove `slot_tokens`, add `context_size`
-        (the vLLM MAX_MODEL_LEN).
-      - Add `thinking_disabled` and `context_guard` fields (matching migrated systems).
-
-- [ ] **B13.** `__main__` block (lines 871-887): update log messages to remove
-      `MODEL_PARALLEL` references and update model name.
-
-### Phase C: Lifecycle Scripts
-
-- [ ] **C1.** Update `start.sh`:
-      - Change pre-flight model port from `8006` to `8011`.
-      - Update pre-flight wait timeout to `300s` (vLLM JIT compilation needs
-        up to 15 minutes on first boot).
-      - Add `/v1/models` probe as vLLM health check fallback (in addition to
-        `/health`).
-      - Remove references to Proof-Reader's `startserver.sh` as the model
-        manager; update to reference `DGXSpark_Setup/vllm-qwen/startserver.sh`.
-      - Update echo messages to reflect vLLM server.
-
-- [ ] **C2.** Update `stop.sh`:
-      - Change references from "llama-server" to "vLLM server."
-      - Keep behavior identical (never touches model server, only stops gateway).
-
-### Phase D: Tests (`tests/test_extract.py`)
-
-- [ ] **D1.** Update docstring: "v2.1" → "v3 (vLLM Migration)."
-
-- [ ] **D2.** Add vLLM config constant tests:
-      - `test_context_size_is_32768()` — assert `CONTEXT_SIZE == 32768`.
-      - `test_model_name_is_vllm()` — assert `MODEL_NAME == "Qwen3.6-35B-A3B-NVFP4"`.
-      - `test_model_url_is_vllm()` — assert `"8011" in MODEL_URL`.
-      - `test_model_parallel_not_defined()` — assert `MODEL_PARALLEL` does not exist.
-      - `test_request_timeout_120()` — assert `REQUEST_TIMEOUT == 120`.
-
-- [ ] **D3.** Rewrite `TestBuildParams`:
-      - `test_level0_no_reasoning_effort()` — assert `reasoning_effort` is
-        **never** present in params (vLLM doesn't support it).
-      - `test_level0_has_chat_template_kwargs()` — assert `chat_template_kwargs`
-        is present at level 0.
-      - `test_level1_drops_chat_template_kwargs()` — assert it's absent at level 1.
-      - `test_degradation_levels_is_2()` — assert `_PARAMS_LEVELS == (0, 1)`.
-
-- [ ] **D4.** Rewrite `TestContextGuard`:
-      - `test_slot_budget_doesnt_exist()` — assert `slot_budget()` function is
-        removed.
-      - `test_context_budget_is_32k()` — assert `usable_prompt_room()` uses
-        full 32768 budget (no division).
-      - `test_check_context_error_mentions_vllm()` — assert error message
-        references "vLLM context budget" not "slot budget."
-
-- [ ] **D5.** Rewrite `TestHttpModelCall`:
-      - Replace all `FakeResp` + `requests.post` monkeypatches with
-        `httpx.Response` + `httpx.AsyncClient` async stubs.
-      - `test_http_call_vllm_2_level_degradation()` — test 2-level (not 3-level).
-      - `test_http_call_vllm_no_reasoning_effort()` — assert `reasoning_effort`
-        is never in the request body.
-      - `test_vllm_usage_tokens_logged()` — assert usage dict from vLLM is parsed.
-
-- [ ] **D6.** Rewrite `TestResolveContent`:
-      - No changes needed — vLLM response shape is compatible.
-
-- [ ] **D7.** Update `TestApiSurface`:
-      - `test_healthz_reports_vllm_fields()` — assert `/healthz` returns
-        `vllm_model_id`, `thinking_disabled`, `context_guard` fields.
-      - `test_healthz_has_no_slot_tokens_field()` — assert no `slot_tokens` in
-        context budget (was present in llama.cpp version).
-      - Update `test_healthz_ok_with_context_crosscheck()` to mock vLLM
-        `/health` + `/v1/models` instead of llama.cpp `/health` + `/props`.
-
-- [ ] **D8.** Update `test_defaults_sync_to_env_example()`:
-      - Remove `MODEL_PARALLEL` assertion.
-      - Update `MODEL_NAME` expected value to `"Qwen3.6-35B-A3B-NVFP4"`.
-      - Update `LLAMA_SERVER_API_KEY` assertion to `"test_key_0000"`.
-      - Update `REQUEST_TIMEOUT` expected value to `120`.
-      - Add `MODEL_URL` assertion.
-
-### Phase E: Verification
-
-- [ ] **E1.** Run the full test suite: `pytest tests/test_extract.py -v`
-      — all tests must pass.
-
-- [ ] **E2.** Manual pre-flight check:
-      - Start vLLM server (`DGXSpark_Setup/vllm-qwen/startserver.sh`).
-      - Run `./start.sh` — pre-flight should confirm vLLM health on `:8011`.
-      - Hit `/healthz` — verify `vllm_model_id`, `thinking_disabled`,
-        `context_guard` fields present.
-      - Hit `/v1/extract` with golden test case — verify 200 + valid JSON.
+- [ ] **E1.** Windows: `pytest -v` — entire suite green.
+- [ ] **E2.** Windows smoke (stub): `TestClient` POST golden file → `200`;
+      `GET /v1/extract` → `405`; `POST -F file=@...txt` raw without JSON still `422` on old endpoint (proves new endpoint was the missing piece).
+- [ ] **E3.** DGX pre-flight: `./start.sh` → vLLM `:8011` healthy → gateway `:8086`
+      `/healthz` healthy → `/docs` lists both extract endpoints.
+- [ ] **E4.** DGX golden file test:
+      ```bash
+      KEY=bol_key_0000
+      curl -s http://127.0.0.1:8086/v1/extract_file -H "x-api-key: $KEY" \
+        -F "file=@tests/cases/bol_golden_input.txt;type=text/markdown" | python3 -m json.tool
+      # expect 200 + AssistantVersion J2.1 + BLNumber YKO2604155
+      ```
+- [ ] **E5.** DGX regression: `curl -i http://127.0.0.1:8086/v1/extract` → `405 + Allow: POST`;
+      `curl -s POST /v1/extract -d '{"bol_text": "..."}'` still `200` (backward compat).
+- [ ] **E6.** OCR handoff checklist to colleague: give her `E4` curl + PowerShell
+      `-Form @{file=...}` snippet, `x-api-key`, `:8086` base URL, and
+      `healthz → 200` pre-check. Confirm her uploader uses `POST multipart field=file`.
 
 ---
 
-## 3. Reference: Migrated Systems
+## 3. Reference
 
-| System | Port | Model | Context | Degradation | HTTP Client |
-|---|---|---|---|---|---|
-| Proof-Reader | 8082 | Qwen3.6-35B-A3B-NVFP4 | 8192 | 2-level | httpx.Async |
-| GDS Extraction | 8084 | Qwen3.6-35B-A3B-NVFP4 | 32768 | 2-level | httpx.Async |
-| QA-Manager | 8083 | Qwen3.6-35B-A3B-NVFP4 | 32768 | 2-level | httpx.Async |
-| **MDPL BOL (this)** | **8086** | **Qwen3.6-35B-A3B-NVFP4** | **32768** | **2-level** | **httpx.Async** |
-
-All share: `test_key_0000` auth, vLLM `:8011`, `chat_template_kwargs` thinking
-suppression, `httpx.AsyncClient` backend, continuous batching (no slot division).
-
----
+| Item | Value |
+|---|---|
+| Gateway port | `8086` (`API_PORT`, `bol_service.py:86`) |
+| vLLM | `:8011`, `Qwen3.6-35B-A3B-NVFP4`, `CONTEXT_SIZE=32768` |
+| Prompt room | `32768-4096-256 = 28216 tokens ≈ 84648 chars cap` |
+| Auth | `x-api-key: bol_key_0000` (dev) |
+| Golden | `tests/cases/bol_golden_input.txt` → `bol_golden_expected.json` (BL `YKO2604155`) |
+| Siblings | Proof-Reader `:8082/:8085`, QA `:8083`, GDS `:8084` — all JSON-in; this is first to add file ingest |
 
 ## 4. Builder Notes
 
-- **`bol_service.py` is a single file (887 lines).** All changes are in-place
-  edits — no new files, no module restructure.
-- **The `model_call` injection pattern** (`Callable[[list, dict], str]`) is
-  intentionally preserved. Even though the production backend becomes async,
-  a `ThreadPoolExecutor` wrapper ensures the callable signature stays compatible
-  with `run_extract()` and `run_extract_batch()` which call `model_call(m, p)`.
-- **`_resolve_content()` fallback chain** (`content` → `reasoning_content` →
-  `thinking` → `reasoning` → `reason`) works with both llama.cpp and vLLM
-  responses for adaptive-thinking Qwen models. No change needed.
-- **`extract_json()` and `_normalize_bol()`** are pure logic — no change needed.
-- **`build_prompt()` and `BOL_SYSTEM`** are domain logic — no change needed.
-- **Customer table + lookup** — no change needed.
+- **Single-file app (918 lines).** All backend changes in-place in `bol_service.py`;
+  no new modules, no restructure.
+- **`model_call` injection preserved** (`Callable[[list, dict], str]`); new endpoint
+  is `async` only for `await file.read()`, then calls sync `run_extract` unchanged.
+- **`python-multipart` is mandatory** — without it every `POST /v1/extract_file`
+  returns `500`/`422` form-parse error. `start.sh` installs from `requirements.txt`
+  automatically.
+- **Never write uploads to disk.** Keep in memory; enforce size cap pre- and
+  post-decode to avoid OOM on malicious large files.
+- **Do not add GET handlers, do not change J2.1 schema, do not touch vLLM server.**
+- **Order:** A → B → C → D → E. Stop and report if any `pytest` fails.

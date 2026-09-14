@@ -1,17 +1,21 @@
-# AI MDPL Bill of Lading Extractor (v2.1 / "J2.1")
+# AI MDPL Bill of Lading Extractor (v3.1 / "J2.1")
 
-Lean, JSON-in / JSON-out **Bill of Lading Extractor** for the Japan market.
-Parses pre-extracted B/L document text into the standardized shipment JSON and
-runs fully offline on the NVIDIA DGX Spark by reusing the already-running
-llama.cpp model server. This service is a **gateway only** — it never starts or
-stops the model server.
+Lean **Bill of Lading Extractor** for the Japan market. Parses pre-extracted
+B/L document text into the standardized shipment JSON and runs fully offline
+on the NVIDIA DGX Spark by reusing the already-running vLLM model server.
+This service is a **gateway only** — it never starts or stops the model server.
+
+Pipeline: `PDF → OCR (separate system) → OCR output as .md text file → BOL extractor`.
+This gateway receives either JSON `{bol_text}` or a single UTF-8 `.md` file.
 
 Architecture mirrors the sibling AI systems: Proof-Reader (:8082 dev / :8085
 prod), QA-Manager (:8083), GDS-Extraction (:8084).
 
-> **Input scope:** pre-extracted plain text only. PDF/image/OCR parsing is
-> deliberately upstream (the OCR pipeline project). Qwen3.8-27B runs without
-> vision (`--mmproj`), same as all siblings.
+> **Input scope:** pre-extracted text only — JSON `{bol_text}` via
+> `POST /v1/extract` or single UTF-8 `.md`/`.txt` file via
+> `POST /v1/extract_file` (multipart field `file`). PDF/image/OCR parsing is
+> deliberately upstream (the separate OCR system). All extract routes are
+> POST-only by design (`GET /v1/extract` → `405 Method Not Allowed`, expected).
 
 ---
 
@@ -77,6 +81,25 @@ Response (200), contract-exact:
 Placeholders per spec §6: `"N/A"` for undetermined strings, `0` for undetermined
 numerics. `AssistantVersion` is ALWAYS `"J2.1"` regardless of document content.
 
+### `POST /v1/extract_file` (MD-file ingest, hardwired OCR handoff)
+
+```bash
+curl -s http://127.0.0.1:8086/v1/extract_file \
+  -H "x-api-key: $KEY" \
+  -F "file=@ocr_output.md;type=text/markdown"
+```
+
+```powershell
+$KEY="bol_key_0000"; $BASE="http://127.0.0.1:8086"
+Invoke-RestMethod -Uri "$BASE/v1/extract_file" -Method Post `
+  -Headers @{"x-api-key"=$KEY} -Form @{file=Get-Item ./ocr_output.md}
+```
+
+Accepts single `.md`/`.markdown`/`.txt` UTF-8 file (multipart field `file`),
+non-empty, size-capped at `usable_prompt_room()*3` chars (~84k). Decoded text
+runs the identical pipeline as `/v1/extract` → same `200 J2.1 JSON`.
+`GET /v1/extract_file` → `405` (expected, use POST).
+
 ### `POST /v1/extract_batch`
 
 ```json
@@ -101,8 +124,9 @@ Sequential processing with per-entry isolation; overall status stays 200:
 
 | Status | Cause |
 |--------|-------|
+| 405 | `GET` on extract routes (`/v1/extract`, `/v1/extract_file`, `/v1/version`) — expected, use POST |
 | 401 | Missing/invalid `x-api-key` |
-| 422 | Malformed body · empty `bol_text` · prompt exceeds slot budget (with re-provisioning guidance) |
+| 422 | Malformed body · empty `bol_text` · wrong file type · non-UTF-8 file · oversized file/prompt (with sizing guidance) |
 | 503 | Model unreachable/timeout · unparseable model JSON (fail-closed) |
 | 500 | Unexpected internal error |
 

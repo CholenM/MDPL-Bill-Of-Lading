@@ -1,22 +1,26 @@
 """
-AI MDPL Bill of Lading Extractor — FastAPI Service (v3, vLLM Migration)
+AI MDPL Bill of Lading Extractor — FastAPI Service (v3.1, MD-File Ingest)
 ======================================================================
-Lean, JSON-in / JSON-out **Bill of Lading Extractor** for the Japan market.
-Parses pre-extracted B/L document text into the standardized shipment JSON
-defined in the project spec (AssistantVersion J2.1), and runs fully offline on
-the NVIDIA DGX Spark by connecting to the shared vLLM model server
-(Qwen3.6-35B-A3B-NVFP4 on :8011). This service is a **gateway only** — it
-never starts or stops the model server (see start.sh / stop.sh).
+Lean **Bill of Lading Extractor** for the Japan market. Parses pre-extracted
+B/L document text into the standardized shipment JSON defined in the project
+spec (AssistantVersion J2.1), and runs fully offline on the NVIDIA DGX Spark
+by connecting to the shared vLLM model server (Qwen3.6-35B-A3B-NVFP4 on
+:8011). This service is a **gateway only** — it never starts or stops the
+model server (see start.sh / stop.sh).
 
-Document parsing (PDF/image/OCR) is deliberately OUT OF SCOPE: callers send
-pre-extracted plain text, matching the Proof-Reader / QA-Manager /
-GDS-Extraction siblings.
+Pipeline: PDF -> OCR (separate system) -> OCR output as .md text file ->
+BOL extractor. Callers send either JSON {bol_text} (POST /v1/extract) or a
+single UTF-8 .md/.txt file (POST /v1/extract_file, multipart field `file`).
+Both converge on the same run_extract pipeline. All extract routes are
+POST-only by design (GET -> 405 Method Not Allowed).
 
 Architecture (mirrors the sibling skeleton):
 
-    Client  --POST /v1/extract-->  FastAPI gateway (:8086)
-            {bol_text}
-            {entries: [{id, bol_text}]}
+    Client  --POST /v1/extract------>  FastAPI gateway (:8086)
+            {bol_text}                 (same run_extract core)
+    Client  --POST /v1/extract_file--> FastAPI gateway (:8086)
+            multipart file=.md        (decoded -> {bol_text})
+            {entries: [{id, bol_text}]} via POST /v1/extract_batch
                                            |
                                            v
                                       vLLM Server (:8011, shared server)
@@ -42,7 +46,7 @@ import logging
 from typing import Callable, Optional, Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Header, Body, status
+from fastapi import FastAPI, Depends, HTTPException, Header, Body, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -751,9 +755,11 @@ def http_model_call(messages: list[dict], params: dict = None) -> str:
 app = FastAPI(
     title="AI MDPL Bill of Lading Extractor API",
     description=(
-        "Lean JSON-in / JSON-out Bill of Lading Extractor for the Japan market "
-        "(assistant version J2.1). Runs Qwen3.6-35B-A3B-NVFP4 via the shared "
-        "vLLM server on the NVIDIA DGX Spark."
+        "Bill of Lading Extractor for the Japan market (assistant version J2.1). "
+        "Accepts JSON {bol_text} via POST /v1/extract or a UTF-8 .md file via "
+        "POST /v1/extract_file (same pipeline). Runs Qwen3.6-35B-A3B-NVFP4 via "
+        "the shared vLLM server on the NVIDIA DGX Spark. Extract routes are "
+        "POST-only (GET -> 405 by design)."
     ),
     version=VERSION,
 )
@@ -796,13 +802,65 @@ class BatchRequest(BaseModel):
     )
 
 
+# --- MD file upload helper ---------------------------------------------------
+ALLOWED_MD_EXTS = {".md", ".markdown", ".txt"}
+
+
+def _max_upload_chars() -> int:
+    """Max decoded chars accepted for a single .md upload.
+
+    Derived from the live context budget (no new .env var, avoids config drift):
+    ``usable_prompt_room() * 3`` chars (≈ 84648 at defaults).
+    """
+    return usable_prompt_room() * 3
+
+
+async def _read_md_upload(file: UploadFile) -> str:
+    """Validate and decode a single uploaded .md/.txt file to bol_text.
+
+    - Extension allowlist (.md/.markdown/.txt, case-insensitive).
+    - Size-capped pre- (bytes) and post-decode (chars) at _max_upload_chars().
+    - UTF-8 strict decode; empty/whitespace-only rejected.
+    - Never writes to disk; raises ValueError (→ 422) on any violation.
+    """
+    import os.path
+
+    filename = (file.filename or "").strip()
+    _, ext = os.path.splitext(filename)
+    if ext.lower() not in ALLOWED_MD_EXTS:
+        raise ValueError(
+            f"Unsupported file type '{ext or '(none)'}' for '{filename}'. "
+            "Use .md/.markdown/.txt UTF-8 markdown text."
+        )
+
+    raw = await file.read()
+    cap = _max_upload_chars()
+    if len(raw) > cap:
+        raise ValueError(
+            f"Uploaded file too large ({len(raw)} bytes > {cap} char budget). "
+            "Submit a smaller B/L document or split the file."
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("File must be UTF-8-encoded markdown text.")
+    if len(text) > cap:
+        raise ValueError(
+            f"Uploaded file too large ({len(text)} chars > {cap} char budget). "
+            "Submit a smaller B/L document or split the file."
+        )
+    if not text.strip():
+        raise ValueError("'bol_text' must be a non-empty string.")
+    return text
+
+
 # --- Endpoints --------------------------------------------------------------
 @app.get("/", tags=["System"])
 async def root():
     return {
         "service": "AI MDPL Bill of Lading Extractor",
         "version": VERSION,
-        "endpoints": ["/v1/extract", "/v1/extract_batch", "/v1/version", "/healthz"],
+        "endpoints": ["/v1/extract", "/v1/extract_file", "/v1/extract_batch", "/v1/version", "/healthz"],
         "docs": "/docs",
     }
 
@@ -869,6 +927,37 @@ async def extract(
         logger.error(f"Unexpected extract error: {exc}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Processing failed.")
 
+    return JSONResponse(content=record)
+
+
+@app.post("/v1/extract_file", response_class=JSONResponse, tags=["Extract"])
+async def extract_file(
+    _api_key: str = Depends(verify_api_key),
+    file: UploadFile = File(...),
+):
+    """Parse a single uploaded .md/.txt B/L file into the J2.1 shipment JSON.
+
+    Hardwired OCR handoff: PDF -> OCR (separate system) -> .md file -> this
+    endpoint. Decodes the file to text and runs the identical run_extract
+    pipeline as POST /v1/extract. POST-only by design (GET -> 405).
+    """
+    import os.path
+
+    table = load_customer_table()
+    try:
+        text = await _read_md_upload(file)
+        record = run_extract({"bol_text": text}, table, http_model_call)
+    except ValueError as exc:
+        # Includes file validation + ContextGuardExceeded (422 with guidance).
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except (ModelUnavailable, ContextExceeded) as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except Exception:  # noqa: BLE001 - avoid leaking internals
+        logger.error("Unexpected extract_file error", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Processing failed.")
+
+    safe_name = os.path.basename(file.filename or "(unnamed)")
+    logger.info(f"extract_file complete | file={safe_name} chars={len(text)} bl_number={record.get('BLNumber')}")
     return JSONResponse(content=record)
 
 
