@@ -1,55 +1,57 @@
-# MDPL Bill of Lading Extractor — Verified Setup Record (v3.2)
+# MDPL Bill of Lading Extractor — Customer Table Incorporation (v4.0)
 
-> **Source of Truth for the Builder.** Status: **VERIFIED — NO BUILD REQUIRED.**
-> Verified on Windows dev machine 2026-09-15: `pytest tests/test_extract.py -q` →
-> **104 passed**. This document supersedes the v3.1 *build* roadmap (the
-> `POST /v1/extract_file` work is done and green) and records the spec review,
-> the four Socratic decisions below, and the verification checklist.
+> **Source of Truth for the Builder.** Status: **READY TO BUILD.**
+> This document supersedes v3.2 (which was `VERIFIED — NO BUILD REQUIRED`).
+> v4.0 incorporates the colleague's 71-row customer table (`customer table.csv`,
+> `C-MDPL0001`–`C-MDPL0071`) as the new `DEFAULT_CUSTOMER_TABLE`.
 >
-> Pipeline (hardwired): `PDF → OCR (separate system, colleague-owned) → OCR output
-> as .md/.txt text file → THIS gateway → J2.1 shipment JSON`.
+> Pipeline (unchanged, hardwired): `PDF → OCR (separate system, colleague-owned)
+> → OCR output as .md/.txt text file → THIS gateway → J2.1 shipment JSON`.
 > This gateway **never** handles PDF/image bytes and never starts/stops the model server.
+>
+> Socratic decisions D8–D11 (2026-09-15, user-confirmed via interrogation):
+> **D8** schema mapping = copy `CONSIGNEE NAME` to both `Buyer` and
+> `RegisteredCustomerName`; **D9** replacement = 71 rows fully REPLACE the 4 old
+> rows, golden `C0003 → C-MDPL0001`; **D10** storage = hardcode as new defaults
+> in `bol_service.py`; **D11** cleaning = drop empty row, strip whitespace /
+> one trailing comma, keep everything else verbatim, keep ambiguity guard.
 
 ---
 
 ## 1. Strategic Design
 
-### 1.1 Spec Review (attached instruction `AI_MDPL_BILL_OF_LADING.md`, "Japan Bill of Lading Extractor v2.1")
+### 1.1 Objectives
 
-| Spec claim | Current setup (`bol_service.py`) | Verdict |
-|---|---|---|
-| Objective lists 15 items incl. **Contract Class** | Code + `§5 JSON schema` + golden files have **14 keys, no Contract Class**; `§4 Extraction` also omits it | **Drift in spec Objective line only.** Decision D4 (2026-09-15): officially **DROP Contract Class**. Spec §5 is authoritative. No code change. |
-| §1 Input: "text, PDF, or image" | Gateway accepts **pre-extracted text only**: JSON `{bol_text}` (`POST /v1/extract`) or UTF-8 `.md`/`.markdown`/`.txt` file (`POST /v1/extract_file`) | **Intentional scope cut.** OCR (PDF/image → .md) is the colleague's separate system. No PDF/image parsing here by design. |
-| §3 Customer table (C0002/C0003/C0005/C0006) | `DEFAULT_CUSTOMER_TABLE` matches exactly; config-overridable via `CUSTOMER_TABLE` env; tolerant matching + ambiguity guard | ✅ Match. Gateway lookup is authoritative (overrides model). |
-| §4 Extraction fields (BLNumber alphanumeric-only, BLDate split, VoyageNumber "N/A" fallback, Brand from Marks & Numbers, etc.) | All encoded in `BOL_SYSTEM` + `_normalize_bol` + `lookup_customer` | ✅ Match. |
-| §4 "Ocean Vessel" vs §5 "ShipVia" naming | Code uses `ShipVia` (== §5 schema) | ✅ §5 wins. Documented, no change. |
-| §5 JSON schema (14 keys, nested `BLDate` + `ShipToDestination`) | `_normalize_bol` is authoritative: forces `AssistantVersion="J2.1"`, drops unknown keys, coerces types | ✅ Exact match (`bol_golden_expected.json` is contract-exact). |
-| §6 Error handling "null or N/A" | Code uses `"N/A"` strings + `0` numerics, nested objects always present | **Decision D6: KEEP `N/A + 0`.** Rationale: JSON schema has no nullable union; `0`/`"N/A"` are fail-safe downstream; all 104 tests pin this. Spec "null" option formally declined. |
-| §7 Output "formatted JSON only" | `extract_json` strips thinking blocks + code fences, locates `{…}`, fails closed (`503`, never fabricates) | ✅ Match (strictly stronger than spec). |
+1. **Replace the placeholder table:** `DEFAULT_CUSTOMER_TABLE` in `bol_service.py`
+   goes from 4 rows (`C0002/C0003/C0005/C0006`, v2.1 spec §3) to **71 rows**
+   (`C-MDPL0001`–`C-MDPL0071`) from `customer table.csv`.
+2. **Preserve the contract:** 14-key J2.1 schema, `AssistantVersion="J2.1"`,
+   placeholders `N/A`/`0`, POST-only endpoints, gateway-authoritative
+   `lookup_customer`. No prompt-logic, matching-logic, or API change —
+   data-only swap + test/doc updates.
+3. **Fix the golden sample:** `tests/cases/bol_golden_expected.json`
+   `CustomerCode: "C0003"` → `"C-MDPL0001"` (same entity `ANA FOODS CO., LTD.`).
+   Input `.txt` is unchanged.
+4. **Keep docs + config in sync:** `.env.example`, `bol-prompts.md`,
+   `README.md` must stop referencing the 4 old codes.
+5. **Stay green:** `pytest tests/test_extract.py -q` → **104 passed** after the swap.
 
-### 1.2 Objectives (v3.2 — verification round)
-
-1. **Lock the contract:** 14-key J2.1 schema, `AssistantVersion` always `"J2.1"`, placeholders `N/A`/`0`. Contract Class stays out.
-2. **Lock dual-format ingest:** gateway accepts **both plain text AND rich markdown** `.md` (tables, `#`, `|`, `**`, Japanese) with **zero preprocessing** — content is opaque inside `<<<BOL_DATA>>>` fences. Verified by design + parity test (see §1.6 / Roadmap V3).
-3. **Prove backward compatibility:** `POST /v1/extract` (JSON) and `POST /v1/extract_file` (multipart `file`) converge on the **same** `run_extract` core and return bit-identical J2.1 JSON.
-4. **Stay gateway-only:** vLLM `:8011` (`Qwen3.6-35B-A3B-NVFP4`, `CONTEXT_SIZE=32768`) is shared and pre-existing; no model/port/schema change in this round.
-5. **Leave docs + code untouched** except this file (Decision D7: verify + document only). Known README staleness (ports `8006`/`Qwen3.8-27B`/`65536` in Port Map / Config / Context sections vs live `8011`/`Qwen3.6`/`32768`) is **logged as tech debt, not fixed in this round**.
-
-### 1.3 Architecture
+### 1.2 Architecture
 
 ```mermaid
 flowchart LR
     PDF[PDF Bill of Lading] --> OCR[External OCR System<br/>colleague-owned]
-    OCR --> MD["ocr_output.md<br/>plain text OR rich markdown<br/>single small UTF-8"]
+    OCR --> MD["ocr_output.md<br/>plain text OR rich markdown"]
     MD -->|Option A: JSON wrapper| JSON["POST /v1/extract<br/>application/json {bol_text}"]
-    MD -->|Option B: direct file| FILE["POST /v1/extract_file<br/>multipart/form-data field=file"]
+    MD -->|Option B: direct file| FILE["POST /v1/extract_file<br/>multipart field=file"]
     JSON --> GW["FastAPI Gateway :8086<br/>bol_service.py<br/>run_extract same core"]
     FILE --> GW
-    GW --> VLLM["vLLM :8011<br/>Qwen3.6-35B-A3B-NVFP4<br/>continuous batching"]
-    VLLM --> OUT["J2.1 shipment JSON<br/>14 keys"]
+    GW -->|build_prompt injects 71-row table| VLLM["vLLM :8011<br/>Qwen3.6-35B-A3B-NVFP4"]
+    VLLM --> NORM["_normalize_bol + lookup_customer<br/>gateway overrides CustomerCode"]
+    NORM --> OUT["J2.1 shipment JSON<br/>14 keys"]
 ```
 
-**Request flow inside gateway (both endpoints converge):**
+**Request flow inside gateway (unchanged, both endpoints converge):**
 
 ```text
 POST /v1/extract         ─┐
@@ -59,38 +61,29 @@ POST /v1/extract_file    ─┘         ↑                                     
                                                     (build_prompt → check_context → model_call → extract_json)
 ```
 
-**Why plain + rich markdown both work (no code change):** `build_prompt()` wraps
-the decoded file verbatim in `<<<BOL_DATA>>> … <<<END_BOL_DATA>>>` delimiter
-fences. Markdown syntax is never interpreted — it is opaque document text to the
-model. `bol-prompts.md:98-101` already records this. A rich-markdown sample
-(`#`, `| table |`, `**bold**`, Japanese) therefore needs no preprocessing,
-no prompt change, and no new dependency.
+**Why 71 rows fit (no code change):** `build_prompt()` renders one line per row
+(`- Code=… | Buyer=… | RegisteredCustomerName=…`). 71 rows ≈ 9–10k chars ≈
+≈3.1–3.4k tokens by the `chars/3` heuristic, vs `usable_prompt_room() = 28216`
+tokens at defaults. Headroom remains >24k tokens for `BOL_DATA`. No
+`CONTEXT_SIZE` / `MODEL_MAX_TOKENS` / `_max_upload_chars` change required.
 
-### 1.4 API Definitions
+### 1.3 API Definitions (unchanged in v4.0)
 
 All endpoints require `x-api-key` except `GET /` and `GET /healthz`. Docs at `/docs`.
 `GET /v1/extract*` intentionally does **not** exist (`405` is correct).
 
 | Endpoint | Method | Request | Success | Notes |
 |---|---|---|---|---|
-| `/` | GET | — | `200 {service, version, endpoints, docs}` | Lists all 5 endpoints incl. `/v1/extract_file` |
-| `/healthz` | GET | — | `200 {status, model_server, context_budget, version}` | Gateway-only liveness; `degraded` when vLLM down |
-| `/v1/extract` | POST | `application/json {"bol_text": string(min 1)}` | `200 J2.1 JSON` | Unchanged; `GET` → `405` |
-| `/v1/extract_file` | POST | `multipart/form-data`, single field `file: (.md/.markdown/.txt)` UTF-8, non-empty, size-capped | `200 J2.1 JSON` (identical schema) | `GET` → `405`; plain **or** rich markdown accepted |
-| `/v1/extract_batch` | POST | `{"entries": [{id?, bol_text}]}` | `200 {results: [{id, status, data/error}]}` | Sequential, per-entry isolation |
-| `/v1/version` | POST | — | `200 {"version": "J2.1"}` | Never touches the model; `GET` → `405` |
+| `/` | GET | — | `200 {service, version, endpoints, docs}` | Unchanged |
+| `/healthz` | GET | — | `200 {status, model_server, context_budget, version}` | `customer_table_rows` becomes `71` |
+| `/v1/extract` | POST | `application/json {"bol_text": string(min 1)}` | `200 J2.1 JSON` | Unchanged |
+| `/v1/extract_file` | POST | `multipart/form-data`, field `file: (.md/.markdown/.txt)` UTF-8 | `200 J2.1 JSON` | Unchanged |
+| `/v1/extract_batch` | POST | `{"entries": [{id?, bol_text}]}` | `200 {results: [...]}` | Unchanged |
+| `/v1/version` | POST | — | `200 {"version": "J2.1"}` | Unchanged |
 
-`POST /v1/extract_file` server behavior (unchanged, verified): field must be
-exactly `file` (else `422`); extension allowlist `.md`/`.markdown`/`.txt`
-case-insensitive (else `422`); size cap `usable_prompt_room()*3` chars (~84,648
-at defaults) pre- and post-decode (else `422`); UTF-8 strict decode (else `422`);
-empty/whitespace-only reject (`422`); then identical `run_extract` downstream
-(`422` guard / `503` model / `500` unexpected). Uploads never touch disk; only
-basename + char count logged.
+### 1.4 Data Schemas
 
-### 1.5 Data Schemas
-
-**J2.1 output (authoritative — `_normalize_bol`, 14 keys, Contract Class excluded):**
+**J2.1 output (authoritative — `_normalize_bol`, 14 keys, unchanged):**
 
 ```json
 {
@@ -111,114 +104,201 @@ basename + char count logged.
 }
 ```
 
-Placeholders: `"N/A"` strings, `0` numerics, nested objects always present.
-`AssistantVersion` forced to `"J2.1"`. Gateway `lookup_customer` overrides model
-`CustomerCode`. Unknown keys dropped.
-
-**Inputs:**
+**Customer table schema (unchanged shape, new rows):**
 
 ```python
-class ExtractRequest(BaseModel):
-    bol_text: str = Field(..., min_length=1)
-
-# extract_file is NOT a pydantic model — FastAPI UploadFile signature:
-# async def extract_file(file: UploadFile = File(...), _api_key: str = Depends(verify_api_key))
-# validation lives in _read_md_upload(file) -> str
+{"Code": str, "Buyer": str, "RegisteredCustomerName": str}
+# D8: Buyer == RegisteredCustomerName == cleaned CONSIGNEE NAME for all 71 rows
 ```
 
-### 1.6 Constraints (C1–C8 carried from v3.1 + D4–D7 new)
+**Authoritative cleaned table (71 rows — Builder: paste verbatim as new `DEFAULT_CUSTOMER_TABLE`):**
 
-- **C1. POST-only is intentional.** No GET handlers will be added (no body semantics, URL limits, PII in logs).
-- **C2. Input is single small UTF-8 `.md`/`.txt` (plain OR rich markdown).** No PDF/image bytes; no batch-file endpoint (batch callers use `POST /v1/extract_batch`).
-- **C3. Reuse, don't fork.** `extract_file` calls `run_extract` — no duplicate prompt/sanitization logic, no schema fork.
-- **C4. Gateway-only, shared vLLM.** `MODEL_URL (:8011)`, `MODEL_NAME (Qwen3.6-35B-A3B-NVFP4)`, `CONTEXT_SIZE (32768)`, `API_PORT (8086)`, `REQUEST_TIMEOUT (120)`, 2-level `chat_template_kwargs` degradation — all frozen.
-- **C5. Backward compatible.** Existing `/v1/extract` clients/tests pass untouched; no new required `.env` var (`test_defaults_sync_to_env_example` green).
-- **C6. Auth + status ladder preserved:** wrong method `405` → bad key `401` → bad body/file `422` → guard/model fail `422`/`503` → unexpected `500`.
-- **C7. Dependency minimal:** `python-multipart` only (already in `requirements.txt`).
-- **C8. Windows-dev testable:** full suite green with stub backend, no GPU/vLLM.
-- **C9 (D4). Contract Class officially dropped.** Spec §5 (14 keys) is authoritative over spec Objective prose. Revisit only if Japan ops supplies a field definition + golden sample.
-- **C10 (D5). Dual-format support is by-design, not by-preprocessing.** Plain text and rich markdown both pass through byte-identical; markdown tokens count toward the same context budget.
-- **C11 (D6). Placeholders `N/A + 0` are contractual.** Spec "null" alternative declined; downstream must handle `"N/A"`/`0`, not `null`.
-- **C12 (D7). Verify + document only.** No code/doc edits in this round besides this file. README drift (§1.2-5) logged, deferred.
+> Source: `customer table.csv` pasted 2026-09-15. Cleaning per D11: drop the
+> empty `,` row; strip surrounding whitespace/quotes; strip ONE trailing `,`
+> (`C-MDPL0013` `XAG PHILIPPINES INC.,` → `XAG PHILIPPINES INC.`); keep all
+> other casing/punctuation verbatim (incl. lowercase `C-MDPL0071` — matching is
+> case-insensitive so do NOT uppercase it).
 
-### 1.7 Edge Cases & Failure Modes
+```python
+DEFAULT_CUSTOMER_TABLE: list[dict] = [
+    {"Code": "C-MDPL0001", "Buyer": "ANA FOODS CO., LTD.", "RegisteredCustomerName": "ANA FOODS CO., LTD."},
+    {"Code": "C-MDPL0002", "Buyer": "ASIA GLOBAL INTERNATIONAL FREIGHT (SHANGHAI) CO., LTD", "RegisteredCustomerName": "ASIA GLOBAL INTERNATIONAL FREIGHT (SHANGHAI) CO., LTD"},
+    {"Code": "C-MDPL0003", "Buyer": "EACHTAKE (CHINA) LIMITED", "RegisteredCustomerName": "EACHTAKE (CHINA) LIMITED"},
+    {"Code": "C-MDPL0004", "Buyer": "FARMIND CORPORATION", "RegisteredCustomerName": "FARMIND CORPORATION"},
+    {"Code": "C-MDPL0005", "Buyer": "SHANGHAI SOFIA INTERNATIONAL TRADING CO.LTD.", "RegisteredCustomerName": "SHANGHAI SOFIA INTERNATIONAL TRADING CO.LTD."},
+    {"Code": "C-MDPL0006", "Buyer": "FELIZA FRESH FRUIT CORP.", "RegisteredCustomerName": "FELIZA FRESH FRUIT CORP."},
+    {"Code": "C-MDPL0007", "Buyer": "HANDS IN HANDS CO., LTD", "RegisteredCustomerName": "HANDS IN HANDS CO., LTD"},
+    {"Code": "C-MDPL0008", "Buyer": "ASIAFRESH VENTURES CORP.", "RegisteredCustomerName": "ASIAFRESH VENTURES CORP."},
+    {"Code": "C-MDPL0009", "Buyer": "CULTIVATION GROUP LIMITED", "RegisteredCustomerName": "CULTIVATION GROUP LIMITED"},
+    {"Code": "C-MDPL0010", "Buyer": "BEIJING YONGXIN HENGCHANG FRUIT CO. LTD", "RegisteredCustomerName": "BEIJING YONGXIN HENGCHANG FRUIT CO. LTD"},
+    {"Code": "C-MDPL0011", "Buyer": "HELON INTERNATIONAL TRADING CORPORATION", "RegisteredCustomerName": "HELON INTERNATIONAL TRADING CORPORATION"},
+    {"Code": "C-MDPL0012", "Buyer": "S&N FRUITS CORPORATION", "RegisteredCustomerName": "S&N FRUITS CORPORATION"},
+    {"Code": "C-MDPL0013", "Buyer": "XAG PHILIPPINES INC.", "RegisteredCustomerName": "XAG PHILIPPINES INC."},
+    {"Code": "C-MDPL0014", "Buyer": "SHANGHAO FRUIT", "RegisteredCustomerName": "SHANGHAO FRUIT"},
+    {"Code": "C-MDPL0015", "Buyer": "SHANGHAI JIEFU FRUIT INDUSTRIAL CO., LTD.", "RegisteredCustomerName": "SHANGHAI JIEFU FRUIT INDUSTRIAL CO., LTD."},
+    {"Code": "C-MDPL0016", "Buyer": "LEEWARD INTERNATIONAL TRADING LTD.", "RegisteredCustomerName": "LEEWARD INTERNATIONAL TRADING LTD."},
+    {"Code": "C-MDPL0017", "Buyer": "SARAP FRUITS AGRIVENTURE, INC.", "RegisteredCustomerName": "SARAP FRUITS AGRIVENTURE, INC."},
+    {"Code": "C-MDPL0018", "Buyer": "SHANGHAI HAODONG INTERNATIONAL TRADE LTD.", "RegisteredCustomerName": "SHANGHAI HAODONG INTERNATIONAL TRADE LTD."},
+    {"Code": "C-MDPL0019", "Buyer": "HELON - SUNOVI INTERNATIONAL TRADING(DALIAN)CO.,LTD", "RegisteredCustomerName": "HELON - SUNOVI INTERNATIONAL TRADING(DALIAN)CO.,LTD"},
+    {"Code": "C-MDPL0020", "Buyer": "HELON - SHANGHAI HAODONG INTERNATIONAL TRADE, LTD", "RegisteredCustomerName": "HELON - SHANGHAI HAODONG INTERNATIONAL TRADE, LTD"},
+    {"Code": "C-MDPL0021", "Buyer": "HELON - SHANGHAI JIAYUANXIN IMPORT AND EXPORT CO., LTD", "RegisteredCustomerName": "HELON - SHANGHAI JIAYUANXIN IMPORT AND EXPORT CO., LTD"},
+    {"Code": "C-MDPL0022", "Buyer": "HELON - LINGXIAN (TIANJIN) INTERNATIONAL SUPPLY CHAIN CO., LTD", "RegisteredCustomerName": "HELON - LINGXIAN (TIANJIN) INTERNATIONAL SUPPLY CHAIN CO., LTD"},
+    {"Code": "C-MDPL0023", "Buyer": "HELON - SHANGHAI RONGLI CHENHE IMPORT AND EXPORT CO., LTD.", "RegisteredCustomerName": "HELON - SHANGHAI RONGLI CHENHE IMPORT AND EXPORT CO., LTD."},
+    {"Code": "C-MDPL0024", "Buyer": "HIRO INTERNATIONAL CO., LTD", "RegisteredCustomerName": "HIRO INTERNATIONAL CO., LTD"},
+    {"Code": "C-MDPL0025", "Buyer": "JINWON TRADING CO., LTD.", "RegisteredCustomerName": "JINWON TRADING CO., LTD."},
+    {"Code": "C-MDPL0026", "Buyer": "JOY FARMIND SUPPLY CHAIN MANAGEMENT LIMITED", "RegisteredCustomerName": "JOY FARMIND SUPPLY CHAIN MANAGEMENT LIMITED"},
+    {"Code": "C-MDPL0027", "Buyer": "LAYSUN (FAR EAST) LIMITED", "RegisteredCustomerName": "LAYSUN (FAR EAST) LIMITED"},
+    {"Code": "C-MDPL0028", "Buyer": "MOHAMMED ABDALLAH SHARBATLY CO., LTD.", "RegisteredCustomerName": "MOHAMMED ABDALLAH SHARBATLY CO., LTD."},
+    {"Code": "C-MDPL0029", "Buyer": "PACIFIC FRESH CO., LTD", "RegisteredCustomerName": "PACIFIC FRESH CO., LTD"},
+    {"Code": "C-MDPL0030", "Buyer": "PACWEST TRADING (SHANGHAI) CO., LTD.", "RegisteredCustomerName": "PACWEST TRADING (SHANGHAI) CO., LTD."},
+    {"Code": "C-MDPL0031", "Buyer": "SHANGHAI JIEFU - SHANGHAI CHENGUAN IMPORT & EXPORT CO., LTD", "RegisteredCustomerName": "SHANGHAI JIEFU - SHANGHAI CHENGUAN IMPORT & EXPORT CO., LTD"},
+    {"Code": "C-MDPL0032", "Buyer": "SHANGHAI GOODFARMER BANANA CO, LTD.", "RegisteredCustomerName": "SHANGHAI GOODFARMER BANANA CO, LTD."},
+    {"Code": "C-MDPL0033", "Buyer": "SHANGHAO FRUIT - SHENZHEN ZHONGQINGDA INTERNATIONAL TRADER CO., LTD", "RegisteredCustomerName": "SHANGHAO FRUIT - SHENZHEN ZHONGQINGDA INTERNATIONAL TRADER CO., LTD"},
+    {"Code": "C-MDPL0034", "Buyer": "XIANFENG (HONG KONG) COMPANY LIMITED", "RegisteredCustomerName": "XIANFENG (HONG KONG) COMPANY LIMITED"},
+    {"Code": "C-MDPL0035", "Buyer": "AGSOUTH FRUITS PACIFIC BRANCH OFFICE", "RegisteredCustomerName": "AGSOUTH FRUITS PACIFIC BRANCH OFFICE"},
+    {"Code": "C-MDPL0036", "Buyer": "FELIZA - XIAMEN TINGYUAN TRADING CO., LTD.", "RegisteredCustomerName": "FELIZA - XIAMEN TINGYUAN TRADING CO., LTD."},
+    {"Code": "C-MDPL0037", "Buyer": "FELIZA - SOFIA INTERNATIONAL TRADING (DALIAN) CO., LTD.", "RegisteredCustomerName": "FELIZA - SOFIA INTERNATIONAL TRADING (DALIAN) CO., LTD."},
+    {"Code": "C-MDPL0038", "Buyer": "PACWEST - SHANGHAI RONGLI CHENHE IMPORT AND EXPORT CO., LTD.", "RegisteredCustomerName": "PACWEST - SHANGHAI RONGLI CHENHE IMPORT AND EXPORT CO., LTD."},
+    {"Code": "C-MDPL0039", "Buyer": "PACIFIC FRESH - KYUNGYEON TRADING CO., LTD", "RegisteredCustomerName": "PACIFIC FRESH - KYUNGYEON TRADING CO., LTD"},
+    {"Code": "C-MDPL0040", "Buyer": "PACIFIC FRESH - SUNRIDGE LIMITED", "RegisteredCustomerName": "PACIFIC FRESH - SUNRIDGE LIMITED"},
+    {"Code": "C-MDPL0041", "Buyer": "SHANGHAO FRUIT - SHANGHAI HAODONG INTERNATIONAL TRADE, LTD", "RegisteredCustomerName": "SHANGHAO FRUIT - SHANGHAI HAODONG INTERNATIONAL TRADE, LTD"},
+    {"Code": "C-MDPL0042", "Buyer": "SHANGHAI JIEFU - SHEN ZHEN HUILAI INDUSTRY DEVELOPMENT CO., LTD.", "RegisteredCustomerName": "SHANGHAI JIEFU - SHEN ZHEN HUILAI INDUSTRY DEVELOPMENT CO., LTD."},
+    {"Code": "C-MDPL0043", "Buyer": "UNIFRUTTI JAPAN CORPORATION", "RegisteredCustomerName": "UNIFRUTTI JAPAN CORPORATION"},
+    {"Code": "C-MDPL0044", "Buyer": "KWEK GLOBAL PTE LTD", "RegisteredCustomerName": "KWEK GLOBAL PTE LTD"},
+    {"Code": "C-MDPL0045", "Buyer": "TIANJIN CAIYU INTERNATIONAL TRADE CO., LTD.", "RegisteredCustomerName": "TIANJIN CAIYU INTERNATIONAL TRADE CO., LTD."},
+    {"Code": "C-MDPL0046", "Buyer": "GLOBE PACIFIC TRADING LTD. (NEH)", "RegisteredCustomerName": "GLOBE PACIFIC TRADING LTD. (NEH)"},
+    {"Code": "C-MDPL0047", "Buyer": "CENTRAL CHAMBERS LAW CORPORATION", "RegisteredCustomerName": "CENTRAL CHAMBERS LAW CORPORATION"},
+    {"Code": "C-MDPL0048", "Buyer": "CHAMBERS RESOURCES PTE LTD", "RegisteredCustomerName": "CHAMBERS RESOURCES PTE LTD"},
+    {"Code": "C-MDPL0049", "Buyer": "DOROTHY ISABEL DRYSDALE", "RegisteredCustomerName": "DOROTHY ISABEL DRYSDALE"},
+    {"Code": "C-MDPL0050", "Buyer": "DRYSDALE ENTERPRISES", "RegisteredCustomerName": "DRYSDALE ENTERPRISES"},
+    {"Code": "C-MDPL0051", "Buyer": "FRANK M. AYRE", "RegisteredCustomerName": "FRANK M. AYRE"},
+    {"Code": "C-MDPL0052", "Buyer": "GARHWAL CHAN & WILLIAMS", "RegisteredCustomerName": "GARHWAL CHAN & WILLIAMS"},
+    {"Code": "C-MDPL0053", "Buyer": "GEORGE M. DRYSDALE", "RegisteredCustomerName": "GEORGE M. DRYSDALE"},
+    {"Code": "C-MDPL0054", "Buyer": "GEORGE ROGERS MARSMAN DRYSDALE", "RegisteredCustomerName": "GEORGE ROGERS MARSMAN DRYSDALE"},
+    {"Code": "C-MDPL0055", "Buyer": "INLAND REVENUE AUTHORITY OF SINGAPORE", "RegisteredCustomerName": "INLAND REVENUE AUTHORITY OF SINGAPORE"},
+    {"Code": "C-MDPL0056", "Buyer": "LEY AND HOWE CORPORATE SERVICES PTE LTD.", "RegisteredCustomerName": "LEY AND HOWE CORPORATE SERVICES PTE LTD."},
+    {"Code": "C-MDPL0057", "Buyer": "MARSMAN DRYSDALE II LLC", "RegisteredCustomerName": "MARSMAN DRYSDALE II LLC"},
+    {"Code": "C-MDPL0058", "Buyer": "MARSMAN ESTATE PLANTATION INC.", "RegisteredCustomerName": "MARSMAN ESTATE PLANTATION INC."},
+    {"Code": "C-MDPL0059", "Buyer": "MARY BLYTHE DRYSDALE", "RegisteredCustomerName": "MARY BLYTHE DRYSDALE"},
+    {"Code": "C-MDPL0060", "Buyer": "MARSMAN DRYSDALE INTERNATIONAL HOLDINGS, INC.", "RegisteredCustomerName": "MARSMAN DRYSDALE INTERNATIONAL HOLDINGS, INC."},
+    {"Code": "C-MDPL0061", "Buyer": "MD INTERNATIONAL LIMITED", "RegisteredCustomerName": "MD INTERNATIONAL LIMITED"},
+    {"Code": "C-MDPL0062", "Buyer": "MD ISALON ORGANIC BANANA AGRI-VENTURES", "RegisteredCustomerName": "MD ISALON ORGANIC BANANA AGRI-VENTURES"},
+    {"Code": "C-MDPL0063", "Buyer": "MD NABUNTURAN AGRI-VENTURES INC.", "RegisteredCustomerName": "MD NABUNTURAN AGRI-VENTURES INC."},
+    {"Code": "C-MDPL0064", "Buyer": "MD PANABO AGRI-VENTURES INC.", "RegisteredCustomerName": "MD PANABO AGRI-VENTURES INC."},
+    {"Code": "C-MDPL0065", "Buyer": "MD RIO VISTA AGRI-VENTURES, INC.", "RegisteredCustomerName": "MD RIO VISTA AGRI-VENTURES, INC."},
+    {"Code": "C-MDPL0066", "Buyer": "NEW JAPAN PRODUCE CO. LTD.", "RegisteredCustomerName": "NEW JAPAN PRODUCE CO. LTD."},
+    {"Code": "C-MDPL0067", "Buyer": "SINGAPORE BUSINESS FEDERATION", "RegisteredCustomerName": "SINGAPORE BUSINESS FEDERATION"},
+    {"Code": "C-MDPL0068", "Buyer": "THE MARSMAN-DRYSDALE FOUNDATION INC.", "RegisteredCustomerName": "THE MARSMAN-DRYSDALE FOUNDATION INC."},
+    {"Code": "C-MDPL0069", "Buyer": "THONG & LIM CONSULTANTS PTE LTD", "RegisteredCustomerName": "THONG & LIM CONSULTANTS PTE LTD"},
+    {"Code": "C-MDPL0070", "Buyer": "MD DAVAO AGRI-VENTURES INC.", "RegisteredCustomerName": "MD DAVAO AGRI-VENTURES INC."},
+    {"Code": "C-MDPL0071", "Buyer": "Shanghai Rongli Chenhe Import and Export Co., Ltd.", "RegisteredCustomerName": "Shanghai Rongli Chenhe Import and Export Co., Ltd."},
+]
+```
+
+**Golden change (D9):** `tests/cases/bol_golden_expected.json`
+`CustomerCode: "C0003"` → `"C-MDPL0001"`. All other 13 keys byte-identical.
+Input `bol_golden_input.txt` (consignee `ANA FOODS CO., LTD`) is unchanged —
+it now resolves to the new code.
+
+### 1.5 Constraints (C1–C12 carried + D8–D11 new)
+
+- **C1–C8 (v3.1/v3.2, still binding).** POST-only; single small UTF-8 `.md`/`.txt`;
+  reuse `run_extract` (no fork); gateway-only shared vLLM (`:8011`,
+  `Qwen3.6-35B-A3B-NVFP4`, `CONTEXT_SIZE=32768`, `API_PORT=8086`); backward
+  compatible endpoints; auth + status ladder `405→401→422→503→500`;
+  dependency-minimal; Windows-dev testable with stub.
+- **C9 (D4).** Contract Class stays dropped. 14 keys only.
+- **C10 (D5).** Plain + rich markdown both pass through opaquely. No preprocessing.
+- **C11 (D6).** Placeholders `N/A + 0` contractual (no `null`).
+- **C12 (D7).** v3.2 was verify-only; v4.0 is a data swap (this roadmap).
+- **C13 (D8). Schema mapping is fixed.** `Buyer == RegisteredCustomerName ==
+  cleaned CONSIGNEE NAME`. Do NOT invent distinct `Buyer` values; do NOT leave
+  `Buyer` empty (empty weakens the step-2 exact-match path in `lookup_customer`).
+- **C14 (D9). Replacement is total.** Delete the 4 old rows. Old codes
+  `C0002/C0003/C0005/C0006` must appear NOWHERE in code, tests, golden, or docs
+  after v4.0 (except this file's history note). Golden `C0003 → C-MDPL0001` is
+  intentional, not a regression.
+- **C15 (D10). Storage is in-code defaults.** Edit `DEFAULT_CUSTOMER_TABLE`
+  in-place in `bol_service.py`. Do NOT set `CUSTOMER_TABLE` env in code or
+  `.env`; do NOT create new modules/files; preserve `load_customer_table()`
+  fallback and `model_call` injection. Single-file app invariant holds.
+- **C16 (D11). Cleaning is minimal + verbatim.** Drop empty row; strip
+  whitespace; `C-MDPL0013` trailing-comma strip only. Keep `C-MDPL0071`
+  lowercase as-is. `lookup_customer`, `_normalize_name`, ambiguity guard
+  (`ambiguous → "N/A"`) are FROZEN — no logic change.
+- **C17. Prompt-budget invariant.** 71 rows must still pass
+  `test_context_budget_32k_default` / `test_usable_prompt_room_vllm_budget`.
+  No `CONTEXT_SIZE` / `MODEL_MAX_TOKENS` / `_SAFETY_MARGIN` change.
+
+### 1.6 Edge Cases & Failure Modes
 
 | Scenario | Handling |
 |---|---|
-| `GET` on any `/v1/extract*` or `/v1/version` | `405 + Allow: POST` (Starlette default). Expected; use POST. |
-| Missing `file` field / wrong field name | `422` (FastAPI validation). |
-| Wrong extension (`.pdf`, `.png`, `.docx`, none) | `422 "Unsupported file type …"`. Never sniff/convert PDF. |
-| Empty (0 bytes) / whitespace-only `.md` | `422` (mirrors `min_length=1`). |
-| Non-UTF-8 bytes | `422 "File must be UTF-8 …"`. No `shift_jis` fallback (single UTF-8 only). |
-| Oversized `.md` (> `usable_prompt_room()*3` chars) | `422` pre-model-call with sizing guidance; honors `CONTEXT_GUARD` strict/warn/off. |
-| Prompt over budget after size cap (system + table overhead) | `422` from `check_context` — defense in depth. |
-| **Rich markdown** (`#`, `\| tables`, `**bold**`, Japanese, newlines) | **Harmless — verbatim inside `<<<BOL_DATA>>>` fences.** No stripping (stripping would destroy Marks & Numbers layout). Counts toward token budget like plain text. |
-| Noisy OCR (extra whitespace, `l`/`1` confusions, split lines) | Passed verbatim; model is tolerant; `BLNumber` sanitizer keeps letters+numbers contract via prompt rule; unparseable → `N/A`/`0`, never invented. |
-| vLLM down / timeout / unparseable JSON | `503` fail-closed (`ModelUnavailable`/`ContextExceeded`). |
-| Missing/invalid `x-api-key` | `401` via `verify_api_key` (all POST routes). |
-| Filename traversal / weird chars / log injection | Ignored except extension check; never written to disk; basename-only logging, never file contents at INFO. |
-| Ambiguous customer (two codes match) | `"N/A"` — never guess; `CustomerName` kept verbatim. |
+| `ANA FOODS CO., LTD` (golden) now matches `C-MDPL0001` | Gateway `lookup_customer` returns `C-MDPL0001`; golden updated to match. Old `C0003` is gone. |
+| Old codes `C0002/C0005/C0006` in a live B/L | Now resolve to `"N/A"` (no row matches) — correct per D9 deprecation. `CustomerName` kept verbatim. |
+| `SHANGHAO FRUIT` (C-MDPL0014) vs `SHANGHAO FRUIT - …` (C-MDPL0033/C-MDPL0041) | Exact normalized match wins when document equals one row exactly. Substring-only queries spanning two codes → `"N/A"` (ambiguity guard, never guess). |
+| `HELON - …` family (C-MDPL0019–C-MDPL0023) + bare `HELON INTERNATIONAL…` (C-MDPL0011) | Same rule: exact wins; bare `HELON` substring matching >1 code → `"N/A"`. |
+| `FELIZA…` / `PACIFIC FRESH…` / `PACWEST…` / `SHANGHAI JIEFU…` families | Same ambiguity guard. Document must carry the full consignee string to resolve. |
+| `XAG PHILIPPINES INC.` with/without trailing comma | `_normalize_name` strips `.,&'"` punctuation, so both forms normalize identically → `C-MDPL0013`. Cleaning the CSV comma is cosmetic; matching is robust either way. |
+| `C-MDPL0071` lowercase in table vs uppercase in document | `_normalize_name` lowercases → match succeeds. Do not re-case the table. |
+| Empty CSV row (`,`) | Dropped at authoring time; never enters the table. `load_customer_table()` malformed-row filter remains as defense-in-depth. |
+| `CUSTOMER_TABLE` env set in some deploy | `load_customer_table()` still honors env override (unchanged). Default path (empty env) now yields 71 rows; `/healthz customer_table_rows == 71`. |
+| Prompt still fits context | 71-row prompt ≈ 3.4k tokens ≪ 28216 room. Oversized-`bol_text` still `422` via `check_context`; behavior unchanged. |
+| Stale references to `C0003` in logs/tests/docs | All must be updated (Roadmap B2–B3). Any remaining `C0002/C0003/C0005/C0006` literal outside this history section is a defect. |
 
 ---
 
-## 2. The Execution Roadmap — Verification Checklist (v3.2)
+## 2. The Execution Roadmap — Build Checklist (v4.0)
 
-> Sequential. All items verified 2026-09-15 on Windows (stub backend, no GPU).
-> Nothing left to build — Builder: **do not write code** unless a check below fails.
+> Sequential. Dependencies ordered: **Table → Golden → Tests → Docs → Verify**.
+> Builder: check off in order; stop and escalate to Architect if any verify step fails.
 
-### Phase V0: Decisions (done — from Socratic interrogation 2026-09-15)
+### Phase B0: Pre-flight (read-only)
 
-- [x] **D4. Contract Class → DROP.** Keep 14-key J2.1 schema; no code/test/golden change.
-- [x] **D5. Dual-format → PLAIN + RICH MARKDOWN both accepted.** No preprocessing; fencing handles both. Parity covered by V3 below.
-- [x] **D6. Placeholders → KEEP `N/A + 0`.** Spec "null" declined; downstream contract unchanged.
-- [x] **D7. Scope → VERIFY + DOCUMENT ONLY.** This file is the only change in this round.
+- [ ] Read `bol_service.py:178-183` (`DEFAULT_CUSTOMER_TABLE`), `tests/test_extract.py:248-340` (`TestLookupCustomer`/`TestLoadCustomerTable`), `tests/cases/bol_golden_expected.json`, `.env.example:54-60`, `bol-prompts.md:66-83`, `README.md:135-150`
+- [ ] Confirm working tree clean (`git status --short`) and baseline green (`python -m pytest tests/test_extract.py -q` → 104 passed before edits)
 
-### Phase V1: Suite green (verified)
+### Phase B1: Swap the table (code, in-place only)
 
-- [x] **V1.** `python -m pytest tests/test_extract.py -q` → **104 passed** (6 pre-existing deprecation warnings: `httpx/starlette.testclient`, `HTTP_422_*` rename — cosmetic only).
-  Verify: rerun `pytest -v`; expect `104 passed`.
+- [ ] Replace `DEFAULT_CUSTOMER_TABLE` in `bol_service.py` with the 71-row literal from §1.4 (verbatim, `Buyer == RegisteredCustomerName`, `C-MDPL0013` without trailing comma, `C-MDPL0071` lowercase kept)
+- [ ] Update the comment above it: `Built-in defaults from the colleague's customer table.csv (71 rows, C-MDPL0001–C-MDPL0071). Used when CUSTOMER_TABLE env is unset/empty or unparseable.`
+- [ ] Do NOT touch `load_customer_table`, `lookup_customer`, `_normalize_name`, prompt builders, endpoints, or vLLM config
 
-### Phase V2: Contract parity (verified by suite)
+### Phase B2: Fix the golden contract
 
-- [x] **V2a.** `TestGoldenSample::test_extract_returns_contract_exact_json` — `POST /v1/extract` golden `.txt` → `200` + body == `bol_golden_expected.json` (`BL YKO2604155`, `C0003`).
-- [x] **V2b.** `TestExtractFile::test_file_happy_path_parity` — same golden bytes via `POST /v1/extract_file` (`ocr.md`) → `200` + identical body. Proves JSON and file paths converge.
-- [x] **V2c.** `test_root_lists_endpoints` — `/`, `/v1/extract`, `/v1/extract_file`, `/v1/extract_batch`, `/v1/version`, `/healthz` all listed.
+- [ ] Edit `tests/cases/bol_golden_expected.json`: `"CustomerCode": "C0003"` → `"CustomerCode": "C-MDPL0001"` (single-line change, no other key touched)
+- [ ] Do NOT touch `tests/cases/bol_golden_input.txt`
 
-### Phase V3: Dual-format (plain + rich markdown) — design-verified, one live sample pending
+### Phase B3: Update the test suite (pin new reality)
 
-- [x] **V3a (design).** `_read_md_upload` does no markdown stripping; `build_prompt` fences content opaquely (`bol-prompts.md:98-101`). Rich markdown therefore flows byte-identical like plain text. No code change needed — answers "is that possible?" with **yes**.
-- [ ] **V3b (one-shot, when colleague delivers sample).** Post her real OCR `.md` (rich) through both endpoints with stub + DGX and diff:
-  ```powershell
-  # Windows (stub parity — add a temp test, do not commit unless it fails)
-  python -m pytest tests/test_extract.py::TestExtractFile -q
-  # DGX (live)
-  KEY=bol_key_0000
-  curl -s http://127.0.0.1:8086/v1/extract_file -H "x-api-key: $KEY" `
-    -F "file=@ocr_sample.md;type=text/markdown" | python3 -m json.tool
-  # expect 200 + AssistantVersion J2.1; compare against POST /v1/extract of same text
-  ```
-  Accept: both return `200` J2.1 JSON with same `BLNumber`. If rich tables break extraction, escalate to Architect (prompt-fencing tweak) — do not preprocess in gateway.
+- [ ] `TestGoldenSample::test_prompt_contains_customer_table_and_fences`: assert `"C-MDPL0001"` in user message (replace `"C0003"`); optionally also assert `"C-MDPL0071"` present and `"C0003"` absent
+- [ ] `TestNormalizeBol::test_extract_json_gateway_side_customer_resolution`: expect `"C-MDPL0001"` (replace `"C0003"`)
+- [ ] `TestLookupCustomer`: retarget to new codes — e.g. exact `ANA Foods Co., LTD → C-MDPL0001`, case-insensitive same, punctuation/bracket `LAYSUN (FAR EAST) LIMITED → C-MDPL0027`, buyer `HIRO INTERNATIONAL CO., LTD → C-MDPL0024` / `FARMIND CORPORATION → C-MDPL0004`, substring `ANA FOODS CO., LTD (TOKYO BRANCH) → C-MDPL0001`; keep no-match/empty/None/ambiguity tests as-is (ambiguity fixture codes `X001/X002` untouched)
+- [ ] `TestLoadCustomerTable::test_env_empty_uses_defaults`: expect `len == 71` and `{"C-MDPL0001", "C-MDPL0071", …}` (replace `len == 4` / `C0002/C0003/C0005/C0006` set)
+- [ ] `test_invalid_json_falls_back_to_defaults`, `test_non_array_falls_back_to_defaults`, `test_all_invalid_rows_fall_back_to_defaults`: expect `len == 71` (replace `4`)
+- [ ] `test_defaults_are_not_mutated`: still compares before/after (no constant change needed, but verify it passes with 71 rows)
+- [ ] `grep -rn "C0002\|C0003\|C0005\|C0006" --include="*.py" --include="*.json" .` → zero hits outside `implementation.md` history
 
-### Phase V4: Failure-ladder spot checks (verified by suite)
+### Phase B4: Sync docs + config comments (no behavior change)
 
-- [x] **V4.** `GET /v1/extract → 405`, `GET /v1/extract_file → 405`, missing/wrong key → `401`, wrong ext / empty / non-UTF-8 / oversize → `422`, bad model JSON → `503`. All covered in `TestExtractFile` + `TestApiSurface`.
+- [ ] `.env.example:54-60` comment: `Leave empty ("") to use the built-in defaults (71 rows, C-MDPL0001–C-MDPL0071 from customer table.csv).` (replace `C0002/C0003/C0005/C0006` line)
+- [ ] `bol-prompts.md` User Message Template: replace the 4 example `- Code=…` lines with 3 representative new lines (e.g. `C-MDPL0001`, `C-MDPL0004`, `C-MDPL0027`) + `… (71 rows total; full list in implementation.md §1.4)`; fix stale header `Qwen3.8-27B` → `Qwen3.6-35B-A3B-NVFP4` only if touching the file anyway (otherwise leave; logged tech debt T1)
+- [ ] `README.md` Registered Customer Lookup section: replace `C0002/C0003/C0005/C0006` with `C-MDPL0001–C-MDPL0071 (71 rows)`; example `CUSTOMER_TABLE` JSON stays valid; example response `CustomerCode: C0003` → `C-MDPL0001`
+- [ ] Do NOT change any endpoint, port, model name, or context math in docs beyond the lines above
 
-### Phase V5: DGX pre-flight (not run in this round — run at deploy)
+### Phase B5: Verify (green gate)
 
-- [ ] **V5a.** `./start.sh` → vLLM `:8011` healthy → gateway `:8086` `/healthz` → `healthy` → `/docs` lists both extract endpoints.
-- [ ] **V5b.** Golden file live test:
-  ```bash
-  KEY=bol_key_0000
-  curl -s http://127.0.0.1:8086/v1/extract_file -H "x-api-key: $KEY" \
-    -F "file=@tests/cases/bol_golden_input.txt;type=text/markdown" | python3 -m json.tool
-  # expect 200 + AssistantVersion J2.1 + BLNumber YKO2604155
-  ```
-- [ ] **V5c.** Regression: `curl -i http://127.0.0.1:8086/v1/extract` → `405 + Allow: POST`; JSON `POST /v1/extract` still `200`.
-- [ ] **V5d.** OCR handoff to colleague: give her V5b curl + PowerShell `-Form @{file=…}` snippet, `x-api-key`, `:8086` base URL, `healthz → 200` pre-check. Confirm uploader uses `POST multipart field=file`.
+- [ ] `python -m pytest tests/test_extract.py -q` → **104 passed** (count unchanged; only assertions retargeted)
+- [ ] `python -m pytest tests/test_extract.py::TestGoldenSample tests/test_extract.py::TestLookupCustomer tests/test_extract.py::TestLoadCustomerTable -v` → all pass
+- [ ] Manual spot check (stub-free logic): `python -c "import bol_service as b; t=b.load_customer_table(); print(len(t)); print(b.lookup_customer('ANA FOODS CO., LTD', t)); print(b.lookup_customer('LAYSUN (FAR EAST) LIMITED', t)); print(b.lookup_customer('SHANGHAO FRUIT', t))"` → `71 / C-MDPL0001 / C-MDPL0027 / C-MDPL0014`
+- [ ] Manual ambiguity check: `lookup_customer('SHANGHAO FRUIT - SHANGHAI HAODONG INTERNATIONAL TRADE, LTD', t)` → `C-MDPL0041`; `lookup_customer('HELON', t)` → `N/A` (multi-code substring, guard holds)
+- [ ] `grep -rni "C0003" README.md bol-prompts.md .env.example tests/ bol_service.py` → zero hits (excluding this file)
+- [ ] DGX pre-flight (deploy time, not Windows): `./start.sh` → `/healthz` shows `customer_table_rows: 71` → golden `.txt` via both `POST /v1/extract` and `POST /v1/extract_file` returns `C-MDPL0001`
 
-### Phase V6: Deferred tech debt (explicitly OUT of scope this round)
+### Phase B6: Deferred tech debt (explicitly OUT of scope)
 
-- [ ] **T1.** README drift: Port Map / Configuration / Context Sizing sections still cite `8006`/`Qwen3.8-27B`/`65536`+slots vs live `8011`/`Qwen3.6-35B-A3B-NVFP4`/`32768` continuous-batching (code + `.env.example` are correct). Fix in a docs-only follow-up with `test_defaults_sync_to_env_example` green.
+- [ ] **T1.** README drift (ports `8006`/`Qwen3.8-27B`/`65536` vs live `8011`/`Qwen3.6`/`32768`) — still deferred unless touched in B4.
+- [ ] **T2.** If ops later wants the 71 rows via `CUSTOMER_TABLE` env instead of defaults, supply a JSON dump — no code change needed (`load_customer_table` already supports it).
 
 ---
 
@@ -229,14 +309,16 @@ class ExtractRequest(BaseModel):
 | Gateway port | `8086` (`API_PORT`) |
 | vLLM | `:8011`, `Qwen3.6-35B-A3B-NVFP4`, `CONTEXT_SIZE=32768` |
 | Prompt room | `32768-4096-256 = 28216 tokens ≈ 84648 chars cap` |
+| 71-row table cost | `≈ 9–10k chars ≈ 3.1–3.4k tokens` — headroom >24k tokens |
 | Auth | `x-api-key: bol_key_0000` (dev) |
-| Golden | `tests/cases/bol_golden_input.txt` → `bol_golden_expected.json` (BL `YKO2604155`) |
-| Spec | `AI_MDPL_BILL_OF_LADING.md` v2.1 (J2.1); §5 schema authoritative over Objective prose |
-| Suite | `104 passed` 2026-09-15, Windows stub backend |
+| Golden | `tests/cases/bol_golden_input.txt` → `bol_golden_expected.json` (BL `YKO2604155`, code `C-MDPL0001` after v4.0) |
+| Source CSV | `customer table.csv` (colleague-supplied; `CODE,CONSIGNEE NAME`; 71 data rows after dropping 1 empty row) |
+| Spec | `AI_MDPL_BILL_OF_LADING.md` v2.1 (J2.1); §5 schema authoritative; §3 4-row table superseded by colleague CSV per D9 |
+| Suite | `104 passed` baseline v3.2; must stay `104 passed` after v4.0 retarget |
 
 ## 4. Builder Notes
 
-- **Do not write code.** This round is verification-only (D7). If any V-phase check fails, stop and escalate to the Architect — do not freelance a fix.
-- **Single-file app.** Any future change stays in-place in `bol_service.py`; no new modules, no restructure; preserve `model_call` injection.
+- **Data swap only.** Any logic change to `lookup_customer`, `_normalize_name`, `build_prompt`, `check_context`, endpoints, or vLLM params is OUT OF SCOPE — escalate to Architect first.
+- **Single-file app.** Change stays in-place in `bol_service.py`; no new modules, no restructure; preserve `model_call` injection.
 - **Never write uploads to disk; never add GET handlers; never change J2.1 schema; never touch the vLLM server.**
-- **Order on deploy:** V5a → V5b → V5c → V5d. Then close.
+- **Order on build:** B0 → B1 → B2 → B3 → B4 → B5. Then close. B6 deferred.

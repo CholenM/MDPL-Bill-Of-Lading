@@ -96,7 +96,9 @@ class TestGoldenSample:
         client.post("/v1/extract", json=_extract_body(), headers=_auth())
         user_msg = seen["messages"][1]["content"]
         assert "REGISTERED CUSTOMER TABLE:" in user_msg
-        assert "C0003" in user_msg
+        assert "C-MDPL0001" in user_msg
+        assert "C-MDPL0071" in user_msg
+        assert "C0003" not in user_msg
         assert "<<<BOL_DATA>>>" in user_msg
         assert _golden_text().strip()[:20] in user_msg
         assert "<<<END_BOL_DATA>>>" in user_msg
@@ -198,7 +200,7 @@ class TestNormalizeBol:
         raw = json.dumps({**_golden(), "CustomerCode": "C9999"})
         table = [dict(r) for r in bol.DEFAULT_CUSTOMER_TABLE]
         out = bol.extract_json(raw, table)
-        assert out["CustomerCode"] == "C0003"
+        assert out["CustomerCode"] == "C-MDPL0001"
 
     def test_extract_json_no_match_resolves_na(self):
         raw = json.dumps({**_golden(), "CustomerName": "UNKNOWN TRADING COMPANY"})
@@ -250,22 +252,22 @@ TABLE = bol.DEFAULT_CUSTOMER_TABLE
 
 class TestLookupCustomer:
     def test_exact_registered_name(self):
-        assert bol.lookup_customer("ANA Foods Co., LTD", TABLE) == "C0003"
+        assert bol.lookup_customer("ANA Foods Co., LTD", TABLE) == "C-MDPL0001"
 
     def test_case_insensitive(self):
-        assert bol.lookup_customer("ana foods co., ltd", TABLE) == "C0003"
+        assert bol.lookup_customer("ana foods co., ltd", TABLE) == "C-MDPL0001"
 
     def test_punctuation_bracket_insensitive(self):
-        assert bol.lookup_customer("laysun far east limited", TABLE) == "C0002"
-        assert bol.lookup_customer("LAYSUN [FAR EAST] LIMITED", TABLE) == "C0002"
+        assert bol.lookup_customer("laysun far east limited", TABLE) == "C-MDPL0027"
+        assert bol.lookup_customer("LAYSUN [FAR EAST] LIMITED", TABLE) == "C-MDPL0027"
 
     def test_buyer_column_match(self):
-        assert bol.lookup_customer("Hiro International", TABLE) == "C0005"
-        assert bol.lookup_customer("Farmind Corporation", TABLE) == "C0006"
+        assert bol.lookup_customer("HIRO INTERNATIONAL CO., LTD", TABLE) == "C-MDPL0024"
+        assert bol.lookup_customer("Farmind Corporation", TABLE) == "C-MDPL0004"
 
     def test_substring_containment(self):
         # Document carries extra context around a registered name.
-        assert bol.lookup_customer("ANA FOODS CO., LTD (TOKYO BRANCH)", TABLE) == "C0003"
+        assert bol.lookup_customer("ANA FOODS CO., LTD (TOKYO BRANCH)", TABLE) == "C-MDPL0001"
 
     def test_no_match_returns_na(self):
         assert bol.lookup_customer("Unknown Trading K.K.", TABLE) == "N/A"
@@ -294,8 +296,10 @@ class TestLoadCustomerTable:
     def test_env_empty_uses_defaults(self, monkeypatch):
         monkeypatch.setattr(bol, "CUSTOMER_TABLE_ENV", "")
         rows = bol.load_customer_table()
-        assert len(rows) == 4
-        assert {r["Code"] for r in rows} == {"C0002", "C0003", "C0005", "C0006"}
+        assert len(rows) == 71
+        codes = {r["Code"] for r in rows}
+        assert {"C-MDPL0001", "C-MDPL0004", "C-MDPL0027", "C-MDPL0071"} <= codes
+        assert "C0003" not in codes
 
     def test_valid_custom_env_overrides(self, monkeypatch):
         monkeypatch.setattr(
@@ -307,11 +311,11 @@ class TestLoadCustomerTable:
     def test_invalid_json_falls_back_to_defaults(self, monkeypatch):
         monkeypatch.setattr(bol, "CUSTOMER_TABLE_ENV", "{not valid json")
         rows = bol.load_customer_table()
-        assert len(rows) == 4
+        assert len(rows) == 71
 
     def test_non_array_falls_back_to_defaults(self, monkeypatch):
         monkeypatch.setattr(bol, "CUSTOMER_TABLE_ENV", '{"Code": "X1"}')
-        assert len(bol.load_customer_table()) == 4
+        assert len(bol.load_customer_table()) == 71
 
     def test_malformed_rows_filtered(self, monkeypatch):
         monkeypatch.setattr(
@@ -328,7 +332,7 @@ class TestLoadCustomerTable:
         monkeypatch.setattr(
             bol, "CUSTOMER_TABLE_ENV",
             json.dumps([{"Code": "", "Buyer": "", "RegisteredCustomerName": ""}]))
-        assert len(bol.load_customer_table()) == 4
+        assert len(bol.load_customer_table()) == 71
 
     def test_defaults_are_not_mutated(self, monkeypatch):
         before = [dict(r) for r in bol.DEFAULT_CUSTOMER_TABLE]

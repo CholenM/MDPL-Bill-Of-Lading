@@ -71,10 +71,10 @@ Built per request by `build_prompt(bol_text, customer_table)`:
 Extract the following Bill of Lading. Output ONLY the required JSON object.
 
 REGISTERED CUSTOMER TABLE:
-- Code=C0002 | Buyer=Laysun [Far East] Limited | RegisteredCustomerName=Laysun [Far East] Limited
-- Code=C0003 | Buyer=ANA Foods Co., LTD | RegisteredCustomerName=ANA Foods Co., LTD
-- Code=C0005 | Buyer=Hiro International | RegisteredCustomerName=Hiro International
-- Code=C0006 | Buyer=Farmind Corporation | RegisteredCustomerName=Farmind Corporation
+- Code=C-MDPL0001 | Buyer=ANA FOODS CO., LTD. | RegisteredCustomerName=ANA FOODS CO., LTD.
+- Code=C-MDPL0004 | Buyer=FARMIND CORPORATION | RegisteredCustomerName=FARMIND CORPORATION
+- Code=C-MDPL0027 | Buyer=LAYSUN (FAR EAST) LIMITED | RegisteredCustomerName=LAYSUN (FAR EAST) LIMITED
+- ... (71 rows total; full list in implementation.md §1.4)
 
 BOL_DATA:
 <<<BOL_DATA>>>

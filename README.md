@@ -65,7 +65,7 @@ Response (200), contract-exact:
   "BLNumber": "YKO2604155",
   "BLDate": { "Month": 4, "Day": 15, "Year": 2026 },
   "CustomerName": "ANA FOODS CO., LTD",
-  "CustomerCode": "C0003",
+  "CustomerCode": "C-MDPL0001",
   "CustomerAddress": "...",
   "Shipper": "...",
   "ShipperAddress": "...",
@@ -135,7 +135,7 @@ Sequential processing with per-entry isolation; overall status stays 200:
 ## Registered Customer Lookup
 
 The customer code table is **config-driven** (decision D3). Default rows come
-from the v2.1 spec (C0002/C0003/C0005/C0006). To add or change customers
+from the colleague's customer table.csv (71 rows, C-MDPL0001–C-MDPL0071). To add or change customers
 without touching code, set `CUSTOMER_TABLE` in `.env` as a JSON array:
 
 ```json
